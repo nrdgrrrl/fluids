@@ -102,6 +102,11 @@ class CollisionSolver:
         self.building_occupied.from_numpy(arrays[2])
         self.world = world
 
+    def reset(self) -> None:
+        """Refresh the current scene's collision geometry in existing fields."""
+        self._validate_radius()
+        self._upload(self.particles.world, _geometry_arrays(self.particles.world))
+
     def resolve(self, settings: Settings | None = None) -> None:
         """Correct positions and incoming velocities, with no particle readback."""
         self._validate_radius()

@@ -6,7 +6,7 @@ Particle readback is used only for assertions in this module.
 
 import os
 import unittest
-from math import exp, pi
+from math import exp, pi, sqrt
 from unittest.mock import patch
 
 import numpy as np
@@ -303,7 +303,10 @@ class DynamicsTests(unittest.TestCase):
     def test_cfl_limit_responds_to_speed_and_integration_requires_fresh_forces(self):
         self.upload([[-10, 4, 10]], [[40, 0, 0]])
         self.assertEqual(self.solver.compute_forces(), 0)
-        expected = CFL_FACTOR * self.state.smoothing_radius / (PRESSURE_STIFFNESS**0.5 + 40)
+        acoustic = CFL_FACTOR * self.state.smoothing_radius / (PRESSURE_STIFFNESS**0.5 + 40)
+        travel = CFL_FACTOR * self.state.spacing
+        displacement = 2 * travel / (40 + sqrt(40**2 + 4 * self.settings.gravity * travel))
+        expected = min(acoustic, displacement)
         self.assertAlmostEqual(self.solver.stable_time_step, expected, delta=1e-8)
         self.solver.integrate(self.solver.stable_time_step)
         with self.assertRaises(RuntimeError):

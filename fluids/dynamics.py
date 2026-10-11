@@ -1,6 +1,8 @@
 """GPU SPH forces, semi-implicit integration, and splash colors.
 
 Construct ``DynamicsSolver(grid)`` after initializing particles and Taichi.
+Applications should use ``Simulation`` as their lifecycle and playback owner.
+The standalone convenience methods below remain available for kernel callers.
 ``advance(frame_time, settings)`` caps elapsed time, scales it by playback speed,
 and takes at most MAX_SUBSTEPS adaptive steps. Excess time and remainders below
 MIN_TIME_STEP are discarded. It returns the grid overflow count; any nonzero
@@ -8,7 +10,7 @@ result requires pausing physics until the scene is repaired or reset.
 
 For a coordinator that owns timing, ``compute_forces(settings)`` rebuilds the
 grid, computes density/pressure, then writes only accelerations. On success,
-``stable_time_step`` gives the current CFL, acceleration, and viscosity limit.
+``stable_time_step`` gives the acoustic, displacement, acceleration, and viscosity limit.
 ``integrate(dt, settings)`` consumes those forces in a separate kernel. ``step``
 combines these operations for one bounded step. Integration resolves collisions
 against the procedural world before the next grid rebuild.
@@ -36,7 +38,7 @@ import taichi as ti
 from .config import (
     CFL_FACTOR, MAX_ACCELERATION, MAX_FRAME_TIME, MAX_SPEED, MAX_SUBSTEPS,
     MAX_TIME_STEP, MIN_DENSITY, MIN_TIME_STEP, NUMERICAL_EPSILON, REST_DENSITY,
-    Settings,
+    SMOOTHING_LENGTH_FACTOR, Settings,
 )
 from .collisions import CollisionSolver
 from .density import PRESSURE_STIFFNESS, DensitySolver
@@ -67,6 +69,13 @@ class DynamicsSolver:
         self.waves = WaveLauncher(self.particles)
         self._step_limit = ti.field(dtype=ti.f32, shape=())
         self._forces_ready = False
+
+    def reset(self) -> None:
+        """Invalidate prepared forces and refresh geometry without allocation."""
+        self._forces_ready = False
+        self._step_limit[None] = MAX_TIME_STEP
+        self.grid.reset()
+        self.collisions.reset()
 
     def launch_wave(self, settings: Settings | None = None) -> None:
         """Add a live offshore impulse; recompute forces before integrating it."""
@@ -186,6 +195,14 @@ class DynamicsSolver:
             dt = CFL_FACTOR * smoothing_radius / (PRESSURE_STIFFNESS**0.5 + speed)
             bounded_magnitude = ti.min(magnitude, MAX_ACCELERATION)
             dt = ti.min(dt, ti.sqrt(CFL_FACTOR * smoothing_radius / ti.max(bounded_magnitude, NUMERICAL_EPSILON)))
+            # Bound semi-implicit displacement, including acceleration during
+            # this step: speed*dt + acceleration*dt^2 <= CFL_FACTOR*spacing.
+            travel = CFL_FACTOR * smoothing_radius / SMOOTHING_LENGTH_FACTOR
+            denominator = speed + ti.sqrt(speed * speed + 4.0 * bounded_magnitude * travel)
+            if denominator > NUMERICAL_EPSILON:
+                dt = ti.min(dt, 2.0 * travel / denominator)
+            if viscosity > NUMERICAL_EPSILON:
+                dt = ti.min(dt, smoothing_radius**2 / (6.0 * viscosity))
             if diffusion_rate > NUMERICAL_EPSILON:
                 dt = ti.min(dt, 0.5 / diffusion_rate)
             ti.atomic_min(self._step_limit[None], dt)
