@@ -142,6 +142,7 @@ class ActionTests(unittest.TestCase):
                 self.assertEqual(self.controls.handle_key(action.keys[0], True), action.name)
                 handler.assert_called_once_with()
         gui = Mock()
+        self.controls.show_help = True
         self.controls.draw_help(gui)
         help_lines = [call.args[0] for call in gui.text.call_args_list]
         for action in ACTIONS:
@@ -263,6 +264,7 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(self.controls.settings.city_seed, 0)
 
     def test_help_toggle_and_escape_exit(self):
+        self.controls.show_help = True
         self.controls.handle_key("h", True)
         gui = Mock()
         self.controls.draw_help(gui)
@@ -309,12 +311,19 @@ class ActionTests(unittest.TestCase):
         import taichi as ti
 
         self.simulation.last_error = None
+        self.simulation.particles.active_count = 100
+        self.simulation.simulated_time = self.simulation.discarded_time = 0.0
+        self.simulation.last_substeps = 0
+        self.simulation.requires_reset.return_value = False
         self.window.running = True
         self.window.get_events.side_effect = [
             [], [], [SimpleNamespace(key="Escape", action="Press")],
         ]
         gui = self.window.get_gui.return_value
         gui.sub_window.side_effect = lambda *args: nullcontext(gui)
+        gui.button.return_value = False
+        gui.checkbox.side_effect = lambda label, selected: selected
+        gui.slider_int.side_effect = lambda label, value, minimum, maximum: value
         gui.slider_float.side_effect = lambda label, value, minimum, maximum: value
         camera = Mock()
         with patch.object(ti.ui, "Camera", return_value=camera):
@@ -327,7 +336,7 @@ class ActionTests(unittest.TestCase):
         gui.sub_window.assert_called_with(
             "Controls", PANEL_RECT.x, PANEL_RECT.y, PANEL_RECT.width, PANEL_RECT.height,
         )
-        self.assertEqual(gui.slider_float.call_count, 8)
+        self.assertEqual(gui.slider_float.call_count, 14)
 
     def test_scene_loop_pauses_on_solver_error_and_camera_still_updates(self):
         import taichi as ti
@@ -335,18 +344,27 @@ class ActionTests(unittest.TestCase):
 
         error = SpatialGridOverflowError(3)
         self.simulation.advance.side_effect = error
+        self.simulation.last_error = error
+        self.simulation.particles.active_count = 100
+        self.simulation.simulated_time = self.simulation.discarded_time = 0.0
+        self.simulation.last_substeps = 0
+        self.simulation.requires_reset.return_value = False
         self.window.running = True
         self.window.get_events.side_effect = [
             [], [SimpleNamespace(key="Escape", action="Press")],
         ]
         gui = self.window.get_gui.return_value
         gui.sub_window.side_effect = lambda *args: nullcontext(gui)
+        gui.button.return_value = False
+        gui.checkbox.side_effect = lambda label, selected: selected
+        gui.slider_int.side_effect = lambda label, value, minimum, maximum: value
         gui.slider_float.side_effect = lambda label, value, minimum, maximum: value
         camera = Mock()
         with patch.object(ti.ui, "Camera", return_value=camera):
             run_scene(self.window, self.simulation, self.renderer)
         self.assertTrue(self.simulation.paused)
-        gui.text.assert_any_call(str(error))
+        text = " ".join(call.args[0] for call in gui.text.call_args_list)
+        self.assertIn(str(error), text)
         camera.position.assert_called_once()
         self.window.show.assert_called_once()
 
