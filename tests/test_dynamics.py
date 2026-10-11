@@ -87,6 +87,23 @@ class DynamicsTests(unittest.TestCase):
         np.testing.assert_array_equal(self.state.accelerations[0], 0)
         np.testing.assert_array_equal(self.state.velocities[0], velocity)
 
+    def test_launch_invalidates_prepared_forces_and_higher_speed_advances_toward_city(self):
+        displacements = []
+        for speed in (2, 8):
+            points, _ = self.upload([[-12, 4, 12]])
+            settings = self.settings.with_updates(gravity=0, viscosity=0,
+                                                 wave_speed=speed, wave_height=0)
+            self.assertEqual(self.solver.compute_forces(settings), 0)
+            self.solver.launch_wave(settings)
+            with self.assertRaisesRegex(RuntimeError, "compute_forces"):
+                self.solver.integrate(0.005, settings)
+            self.assertEqual(self.solver.step(0.005, settings), 0)
+            displacements.append(self.state.positions[0][0] - points[0, 0])
+            np.testing.assert_array_equal(self.state.velocities[0], [speed, 0, 0])
+            self.assertEqual(self.state.count[None], 1)
+        self.assertGreater(displacements[0], 0)
+        self.assertGreater(displacements[1], displacements[0])
+
     def test_forces_match_reference_without_mutating_the_shared_snapshot(self):
         points, velocities = self.upload(
             [[-18.35, 1.55, 1.55], [-18.05, 1.75, 1.75], [-18.25, 1.95, 1.6],
