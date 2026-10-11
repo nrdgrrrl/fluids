@@ -2,9 +2,11 @@
 
 Lengths are metres and time is seconds. The rectangular domain uses (x, y, z)
 coordinates with y pointing up and gravity acting in the negative y direction.
-Water depth and building heights are measured from the domain floor. Wave
-amplitude is peak displacement from still water; wave direction is measured in
-degrees from +x toward +z in the horizontal plane.
+Water depth and building heights are measured from the domain floor. Launched
+waves travel toward +x. Wave height controls lift energy, not measured crest
+height; wave width is the full offshore impulse band. The earlier amplitude,
+period, and direction settings remain available for compatibility but do not
+affect launched impulses.
 SETTINGS_SPECS is the source of defaults, inclusive ranges, units, and reset
 policy; consumers should use it instead of defining their own slider bounds.
 
@@ -98,6 +100,10 @@ SETTINGS_SPECS = MappingProxyType({
     "wave_direction": SettingSpec(
         "Wave direction", "waves", 0.0, 0.0, 360.0, "degrees",
     ),
+    "wave_speed": SettingSpec("Wave forward speed", "waves", 10.0, 0.0, MAX_SPEED, "m/s"),
+    # At x = -12, a full width of 16 m spans only the ocean, from -20 to -4.
+    "wave_width": SettingSpec("Wave width", "waves", 6.0, 0.5, 16.0, "m"),
+    "wave_height": SettingSpec("Wave lift height", "waves", 1.0, 0.0, 10.0, "m"),
     "city_seed": SettingSpec(
         "City seed", "city", 0, 0, 2**32 - 1, integer=True, requires_reset=True,
     ),
@@ -148,6 +154,9 @@ class Settings:
     collision_restitution: float = SETTINGS_SPECS["collision_restitution"].default
     collision_friction: float = SETTINGS_SPECS["collision_friction"].default
     playback_speed: float = SETTINGS_SPECS["playback_speed"].default
+    wave_speed: float = SETTINGS_SPECS["wave_speed"].default
+    wave_width: float = SETTINGS_SPECS["wave_width"].default
+    wave_height: float = SETTINGS_SPECS["wave_height"].default
 
     def __post_init__(self) -> None:
         # Validate every field and cross-field constraint before normalization.

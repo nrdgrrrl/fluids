@@ -42,6 +42,7 @@ from .collisions import CollisionSolver
 from .density import PRESSURE_STIFFNESS, DensitySolver
 from .grid import CELL_CAPACITY, GRID_SHAPE, SpatialGrid
 from .particles import WATER_COLOR
+from .waves import WaveLauncher
 
 
 SPLASH_COLOR = (0.65, 0.88, 1.0)
@@ -63,7 +64,13 @@ class DynamicsSolver:
         self.particles = grid.particles
         self.density = DensitySolver(grid)
         self.collisions = CollisionSolver(self.particles)
+        self.waves = WaveLauncher(self.particles)
         self._step_limit = ti.field(dtype=ti.f32, shape=())
+        self._forces_ready = False
+
+    def launch_wave(self, settings: Settings | None = None) -> None:
+        """Add a live offshore impulse; recompute forces before integrating it."""
+        self.waves.launch(settings)
         self._forces_ready = False
 
     @property
