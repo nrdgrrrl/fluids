@@ -216,26 +216,33 @@ class Controls:
 
     def update(self, window) -> bool:
         """Consume GGUI press/release events, then update continuous mouse input."""
-        events = window.get_events()
+        events = iter(window.get_events())
         cursor = window.get_cursor_pos()
         width, height = window.get_window_shape()
         aspect_ratio = width / max(height, 1)
-        for event in events:
-            if event.action in ("Press", "Release"):
-                if event.key in ("LMB", "RMB"):
-                    if event.action == "Press":
-                        self._mouse_buttons.add(event.key)
+        try:
+            for event in events:
+                if event.action in ("Press", "Release"):
+                    if event.key in ("LMB", "RMB"):
+                        if event.action == "Press":
+                            self._mouse_buttons.add(event.key)
+                        else:
+                            self._mouse_buttons.discard(event.key)
+                        # Observe releases even if another drag starts between two
+                        # frames, rather than inheriting the previous capture.
+                        self.camera.update_mouse(
+                            cursor, left_pressed="LMB" in self._mouse_buttons,
+                            right_pressed="RMB" in self._mouse_buttons,
+                            panel_rect=self.panel_rect, aspect_ratio=aspect_ratio,
+                        )
                     else:
-                        self._mouse_buttons.discard(event.key)
-                    # Observe releases even if another drag starts between two
-                    # frames, rather than inheriting the previous capture.
-                    self.camera.update_mouse(
-                        cursor, left_pressed="LMB" in self._mouse_buttons,
-                        right_pressed="RMB" in self._mouse_buttons,
-                        panel_rect=self.panel_rect, aspect_ratio=aspect_ratio,
-                    )
-                else:
-                    self.handle_key(event.key, event.action == "Press")
+                        self.handle_key(event.key, event.action == "Press")
+        finally:
+            # GGUI consumed the whole batch. If an action failed, preserve its
+            # remaining key releases before the error reaches the scene loop.
+            for event in events:
+                if event.action == "Release" and event.key not in ("LMB", "RMB"):
+                    self.handle_key(event.key, False)
         self._mouse_buttons = {
             key for key in ("LMB", "RMB") if window.is_pressed(key)
         }

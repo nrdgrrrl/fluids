@@ -178,6 +178,43 @@ class ActionTests(unittest.TestCase):
                 self.controls.handle_key(key, True)
                 self.assertEqual(handler.call_count, 2)
 
+    def test_solver_error_preserves_queued_releases_and_next_press_after_reset(self):
+        from fluids.simulation import SpatialGridOverflowError
+
+        self.controls.handle_key("w", True)
+        error = SpatialGridOverflowError(3)
+        self.simulation.step.side_effect = error
+        self.window.get_events.return_value = [
+            SimpleNamespace(key="n", action="Press"),
+            SimpleNamespace(key="N", action="Release"),
+            SimpleNamespace(key="w", action="Release"),
+            SimpleNamespace(key="c", action="Press"),
+            SimpleNamespace(key="c", action="Release"),
+        ]
+        with self.assertRaises(SpatialGridOverflowError) as raised:
+            self.controls.update(self.window)
+        self.assertIs(raised.exception, error)
+        self.simulation.step.assert_called_once_with(self.settings)
+        self.simulation.reset.assert_not_called()
+
+        self.window.get_events.return_value = [
+            SimpleNamespace(key="r", action="Press"),
+            SimpleNamespace(key="r", action="Release"),
+        ]
+        self.controls.update(self.window)
+        self.simulation.reset.assert_called_once_with(self.settings)
+        self.simulation.step.side_effect = None
+        self.window.get_events.return_value = [
+            SimpleNamespace(key="n", action="Press"),
+            SimpleNamespace(key="w", action="Press"),
+        ]
+        self.controls.update(self.window)
+        self.assertEqual(self.simulation.step.call_count, 2)
+        self.assertEqual(self.simulation.launch_wave.call_count, 2)
+        self.controls.update(self.window)
+        self.assertEqual(self.simulation.step.call_count, 2)
+        self.assertEqual(self.simulation.launch_wave.call_count, 2)
+
     def test_paused_camera_and_zoom_work_without_advancing_physics(self):
         self.window.is_pressed.side_effect = lambda key: key == "RMB"
         self.controls.update(self.window)
