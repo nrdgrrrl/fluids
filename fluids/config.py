@@ -45,6 +45,7 @@ MAX_FRAME_TIME = 0.1
 MAX_SUBSTEPS = 16
 CFL_FACTOR = 0.4
 MAX_SPEED = 50.0  # m/s; solver velocity cap
+MAX_ACCELERATION = 1000.0  # m/s^2; cap the magnitude of combined forces
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,8 @@ SETTINGS_SPECS = MappingProxyType({
     "viscosity": SettingSpec(
         "Kinematic viscosity", "physics", 0.01, 0.0, 1.0, "m^2/s",
     ),
+    # Exponential velocity decay per second, independent of substep frequency.
+    "damping": SettingSpec("Velocity damping", "physics", 0.1, 0.0, 10.0, "1/s"),
     # Zero pauses integration; speeds above one still obey solver step limits.
     "playback_speed": SettingSpec("Playback speed", "simulation", 1.0, 0.0, 4.0, "x"),
 })
@@ -138,6 +141,7 @@ class Settings:
     building_max_height: float = SETTINGS_SPECS["building_max_height"].default
     gravity: float = SETTINGS_SPECS["gravity"].default
     viscosity: float = SETTINGS_SPECS["viscosity"].default
+    damping: float = SETTINGS_SPECS["damping"].default
     playback_speed: float = SETTINGS_SPECS["playback_speed"].default
 
     def __post_init__(self) -> None:
