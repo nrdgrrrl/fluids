@@ -111,8 +111,26 @@ class DynamicsTests(unittest.TestCase):
         dt = min(0.002, self.solver.stable_time_step)
         self.solver.integrate(dt, settings)
         expected_velocity = velocities + expected * dt
+        expected_position = points + expected_velocity * dt
+        # The corner particle starts outside the radius-adjusted walls. The
+        # integration contract now includes container projection and impacts.
+        lower = np.asarray(self.state.world.domain_min) + self.state.collision_radius
+        upper = np.asarray(self.state.world.domain_max) - self.state.collision_radius
+        for i in range(len(points)):
+            for axis in range(3):
+                direction = 0
+                if expected_position[i, axis] <= lower[axis]:
+                    expected_position[i, axis] = lower[axis]
+                    direction = 1
+                elif expected_position[i, axis] >= upper[axis]:
+                    expected_position[i, axis] = upper[axis]
+                    direction = -1
+                if expected_velocity[i, axis] * direction < 0:
+                    normal_speed = expected_velocity[i, axis]
+                    expected_velocity[i] *= 1 - settings.collision_friction
+                    expected_velocity[i, axis] = -settings.collision_restitution * normal_speed
         np.testing.assert_allclose(self.state.velocities.to_numpy()[:len(points)], expected_velocity, rtol=1e-5, atol=2e-6)
-        np.testing.assert_allclose(self.state.positions.to_numpy()[:len(points)], points + expected_velocity * dt, atol=2e-6)
+        np.testing.assert_allclose(self.state.positions.to_numpy()[:len(points)], expected_position, atol=2e-6)
 
     def test_pressure_is_repulsive_and_symmetric_for_unequal_density(self):
         self.upload([[-10, 4, 10], [-9.7, 4, 10], [-9.55, 4.2, 10]])
