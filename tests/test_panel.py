@@ -199,6 +199,7 @@ class PanelTests(unittest.TestCase):
         self.panel.perform_action("toggle_pause")
         self.assertIs(self.controls.last_error, error)
 
+        self.simulation.paused = True
         self.simulation.step.side_effect = SpatialGridOverflowError(7)
         self.panel.draw(Gui(clicks={"Single step (N)"}))
         self.assertTrue(self.simulation.paused)

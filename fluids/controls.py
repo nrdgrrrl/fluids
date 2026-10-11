@@ -18,9 +18,8 @@ normalized bottom-left coordinates. The same rectangle places the panel and
 captures mouse gestures, including its title, padding, and scrollbar. Input
 updates must not be gated on Simulation.paused or playback speed.
 
-Run ``python -m fluids.controls`` for an interactive GGUI scene with the shared
-panel and all settings. The original ``fluids`` launcher remains
-the resizable empty-window checkpoint; GGUI in Taichi 1.7.4 has a fixed size.
+The desktop loop lives in ``fluids.app``. Both ``fluids`` and
+``python -m fluids.controls`` launch it; GGUI in Taichi 1.7.4 has a fixed size.
 """
 
 from dataclasses import dataclass
@@ -67,7 +66,7 @@ class Action:
 # GGUI reports letters in lowercase and the main keyboard's plus key as '='.
 ACTIONS = (
     Action("toggle_pause", (" ",), "Space", "Pause or resume physics"),
-    Action("single_step", ("n",), "N", "Advance one physics step (also while paused)"),
+    Action("single_step", ("n",), "N", "Advance one physics step while paused"),
     Action("reset_simulation", ("r",), "R", "Reset water and city with current settings"),
     Action("new_city", ("c",), "C", "Generate a new city and reset water"),
     Action("launch_wave", ("w",), "W", "Launch one wave with current settings"),
@@ -264,6 +263,8 @@ class Controls:
             for event in events:
                 if event.action == "Release" and event.key not in ("LMB", "RMB"):
                     self.handle_key(event.key, False)
+                elif event.action == "Press" and event.key.lower() == "escape":
+                    self.handle_key(event.key, True)
         self._mouse_buttons = {
             key for key in ("LMB", "RMB") if window.is_pressed(key)
         }
@@ -291,10 +292,21 @@ class Controls:
                     gui.text(f"{action.shortcut}: {action.description}")
 
     def toggle_pause(self) -> None:
+        if self._overflowed():
+            return
         self.simulation.paused = not self.simulation.paused
 
     def single_step(self) -> None:
-        self.simulation.step(self.settings)
+        if self.simulation.paused and not self._overflowed():
+            self.simulation.step(self.settings)
+
+    def _overflowed(self) -> bool:
+        """Reset is required before another attempt at an incomplete grid."""
+        from .simulation import SpatialGridOverflowError
+
+        return isinstance(self.last_error, SpatialGridOverflowError) or isinstance(
+            self.simulation.last_error, SpatialGridOverflowError,
+        )
 
     def reset_simulation(self) -> None:
         self.simulation.reset(self.settings)
@@ -331,83 +343,17 @@ class Controls:
 
 
 def run_scene(window, simulation, renderer) -> Controls:
-    """Run the scene with input, physics, rendering, and the shared panel.
+    """Compatibility entry point for callers that already own scene resources."""
+    from .app import Application
 
-    A paused frame still processes camera input and draws the latest scene.
-    The caller owns initialization and window destruction. Recoverable solver
-    errors pause physics and remain visible in the panel until reset.
-    """
-    from time import monotonic
-
-    import taichi as ti
-
-    from .simulation import SpatialGridOverflowError
-    from .panel import ParameterPanel
-
-    controls = Controls(simulation, renderer=renderer)
-    panel = ParameterPanel(controls)
-    camera = ti.ui.Camera()
-    canvas, scene, gui = window.get_canvas(), window.get_scene(), window.get_gui()
-    previous = monotonic()
-    while window.running:
-        now = monotonic()
-        frame_time, previous = now - previous, now
-        try:
-            if not controls.update(window):
-                break
-        except (ValueError, SpatialGridOverflowError):
-            # Shared dispatch has recorded a failed keyboard action. A failed
-            # reset leaves the requested settings and the old scene available.
-            pass
-        try:
-            simulation.advance(frame_time, controls.settings)
-        except SpatialGridOverflowError as exc:
-            simulation.paused = True
-            controls.last_error = exc
-
-        controls.camera.apply(camera)
-        scene.set_camera(camera)
-        particles = simulation.particles
-        renderer.render(
-            scene, particle_positions=particles.positions,
-            particle_radius=particles.collision_radius, particle_count=particles.active_count,
-        )
-        canvas.set_background_color((0.035, 0.055, 0.085))
-        canvas.scene(scene)
-        panel.draw(gui, frame_time)
-        window.show()
-    return controls
+    return Application(window, simulation=simulation, renderer=renderer).run()
 
 
 def main() -> int:
-    """Interactive scene entry point, leaving the bootstrap checkpoint intact."""
-    import os
-    import sys
+    """Launch the same application as the console entry point."""
+    from .__main__ import main as app_main
 
-    try:
-        import taichi as ti
-
-        from .bootstrap import initialize_gpu
-        from .rendering import Renderer
-        from .simulation import Simulation
-
-        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
-            raise RuntimeError("Run Fluids in a desktop graphics session with DISPLAY set.")
-        initialize_gpu()
-        window = ti.ui.Window("Fluids — coastal wave sandbox", (1440, 900), vsync=True)
-        try:
-            simulation = Simulation()
-            run_scene(window, simulation, Renderer(simulation.world))
-        finally:
-            window.destroy()
-    except (ImportError, OSError, RuntimeError) as exc:
-        print(f"fluids: {exc}", file=sys.stderr)
-        if exc.__cause__ is not None:
-            print(f"Details: {exc.__cause__}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
-    return 0
+    return app_main()
 
 
 if __name__ == "__main__":
