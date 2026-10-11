@@ -9,9 +9,9 @@ on import. Construct ``Controls(simulation)`` once, then, on *every* frame:
     renderer.update_world(simulation.world)  # R and C can rebuild the city
     controls.camera.apply(camera)
     scene.set_camera(camera)
-    with controls.panel(window.get_gui()) as gui:
-        # Place settings sliders here, using controls.settings.with_updates(...).
-        controls.draw_help(gui)
+    panel.draw(window.get_gui(), frame_time)
+
+Construct ``ParameterPanel(controls)`` from ``fluids.panel`` once before the loop.
 
 PANEL_RECT uses GGUI's normalized top-left UI coordinates. Mouse positions use
 normalized bottom-left coordinates. The same rectangle places the panel and
@@ -19,7 +19,7 @@ captures mouse gestures, including its title, padding, and scrollbar. Input
 updates must not be gated on Simulation.paused or playback speed.
 
 Run ``python -m fluids.controls`` for an interactive GGUI scene with the shared
-panel and live wave/playback sliders. The original ``fluids`` launcher remains
+panel and all settings. The original ``fluids`` launcher remains
 the resizable empty-window checkpoint; GGUI in Taichi 1.7.4 has a fixed size.
 """
 
@@ -78,6 +78,7 @@ ACTIONS = (
     Action("quit", ("escape",), "Escape", "Exit"),
 )
 ACTION_KEYS = MappingProxyType({key: action for action in ACTIONS for key in action.keys})
+ACTION_NAMES = MappingProxyType({action.name: action for action in ACTIONS})
 MOUSE_HELP = ("Left drag: Orbit the scene", "Right drag: Pan the camera target")
 
 
@@ -196,7 +197,8 @@ class Controls:
         self.renderer = renderer
         self.panel_rect = panel_rect
         self.camera = CameraController()
-        self.show_help = True
+        self.show_help = False
+        self.last_error: Exception | None = None
         self.quit_requested = False
         self._held_keys: set[str] = set()
         self._mouse_buttons: set[str] = set()
@@ -211,8 +213,27 @@ class Controls:
         if action is None or key in self._held_keys:
             return None
         self._held_keys.add(key)
-        getattr(self, action.name)()
+        self.dispatch_action(action.name)
         return action.name
+
+    def dispatch_action(self, name: str) -> None:
+        """Shared button/keyboard entry point, with recoverable error state.
+
+        Callers catch recoverable exceptions to continue drawing the scene.
+        Successful reset actions clear the error; unrelated actions retain it.
+        """
+        from .simulation import SpatialGridOverflowError
+
+        action = ACTION_NAMES[name]
+        try:
+            getattr(self, action.name)()
+        except (ValueError, SpatialGridOverflowError) as exc:
+            self.last_error = exc
+            if isinstance(exc, SpatialGridOverflowError):
+                self.simulation.paused = True
+            raise
+        if name in ("reset_simulation", "new_city"):
+            self.last_error = None
 
     def update(self, window) -> bool:
         """Consume GGUI press/release events, then update continuous mouse input."""
@@ -321,24 +342,28 @@ def run_scene(window, simulation, renderer) -> Controls:
     import taichi as ti
 
     from .simulation import SpatialGridOverflowError
+    from .panel import ParameterPanel
 
     controls = Controls(simulation, renderer=renderer)
+    panel = ParameterPanel(controls)
     camera = ti.ui.Camera()
     canvas, scene, gui = window.get_canvas(), window.get_scene(), window.get_gui()
     previous = monotonic()
-    error = ""
     while window.running:
         now = monotonic()
         frame_time, previous = now - previous, now
         try:
             if not controls.update(window):
                 break
+        except (ValueError, SpatialGridOverflowError):
+            # Shared dispatch has recorded a failed keyboard action. A failed
+            # reset leaves the requested settings and the old scene available.
+            pass
+        try:
             simulation.advance(frame_time, controls.settings)
-            if simulation.last_error is None:
-                error = ""
         except SpatialGridOverflowError as exc:
             simulation.paused = True
-            error = str(exc)
+            controls.last_error = exc
 
         controls.camera.apply(camera)
         scene.set_camera(camera)
@@ -349,18 +374,7 @@ def run_scene(window, simulation, renderer) -> Controls:
         )
         canvas.set_background_color((0.035, 0.055, 0.085))
         canvas.scene(scene)
-        with controls.panel(gui):
-            gui.text("Paused" if simulation.paused else "Running")
-            for name in ("wave_speed", "wave_width", "wave_height", "playback_speed"):
-                spec = SETTINGS_SPECS[name]
-                value = gui.slider_float(
-                    f"{spec.label} ({spec.unit})", getattr(controls.settings, name),
-                    spec.minimum, spec.maximum,
-                )
-                controls.settings = controls.settings.with_updates(**{name: value})
-            if error:
-                gui.text(error)
-            controls.draw_help(gui)
+        panel.draw(gui, frame_time)
         window.show()
     return controls
 
