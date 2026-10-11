@@ -1,0 +1,8 @@
+# Local environments and generated Python artifacts should not enter reviews.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
