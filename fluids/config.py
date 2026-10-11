@@ -118,6 +118,9 @@ SETTINGS_SPECS = MappingProxyType({
     ),
     # Exponential velocity decay per second, independent of substep frequency.
     "damping": SettingSpec("Velocity damping", "physics", 0.1, 0.0, 10.0, "1/s"),
+    # Fraction of incoming normal speed returned, and tangential speed removed.
+    "collision_restitution": SettingSpec("Collision bounce", "physics", 0.2, 0.0, 1.0),
+    "collision_friction": SettingSpec("Collision friction", "physics", 0.1, 0.0, 1.0),
     # Zero pauses integration; speeds above one still obey solver step limits.
     "playback_speed": SettingSpec("Playback speed", "simulation", 1.0, 0.0, 4.0, "x"),
 })
@@ -142,6 +145,8 @@ class Settings:
     gravity: float = SETTINGS_SPECS["gravity"].default
     viscosity: float = SETTINGS_SPECS["viscosity"].default
     damping: float = SETTINGS_SPECS["damping"].default
+    collision_restitution: float = SETTINGS_SPECS["collision_restitution"].default
+    collision_friction: float = SETTINGS_SPECS["collision_friction"].default
     playback_speed: float = SETTINGS_SPECS["playback_speed"].default
 
     def __post_init__(self) -> None:

@@ -10,8 +10,8 @@ For a coordinator that owns timing, ``compute_forces(settings)`` rebuilds the
 grid, computes density/pressure, then writes only accelerations. On success,
 ``stable_time_step`` gives the current CFL, acceleration, and viscosity limit.
 ``integrate(dt, settings)`` consumes those forces in a separate kernel. ``step``
-combines these operations for one bounded step. Resolve collisions after each
-integration (Issue 09), before the next grid rebuild.
+combines these operations for one bounded step. Integration resolves collisions
+against the procedural world before the next grid rebuild.
 
 Pressure uses -m * (p_i/rho_i^2 + p_j/rho_j^2) * grad(W_spiky), so each pair
 has equal and opposite pressure acceleration before the magnitude safeguard.
@@ -38,6 +38,7 @@ from .config import (
     MAX_TIME_STEP, MIN_DENSITY, MIN_TIME_STEP, NUMERICAL_EPSILON, REST_DENSITY,
     Settings,
 )
+from .collisions import CollisionSolver
 from .density import PRESSURE_STIFFNESS, DensitySolver
 from .grid import CELL_CAPACITY, GRID_SHAPE, SpatialGrid
 from .particles import WATER_COLOR
@@ -61,6 +62,7 @@ class DynamicsSolver:
         self.grid = grid
         self.particles = grid.particles
         self.density = DensitySolver(grid)
+        self.collisions = CollisionSolver(self.particles)
         self._step_limit = ti.field(dtype=ti.f32, shape=())
         self._forces_ready = False
 
@@ -94,9 +96,10 @@ class DynamicsSolver:
         settings = self.particles.settings if settings is None else settings
         self._integrate(dt, settings.damping)
         self._forces_ready = False
+        self.collisions.resolve(settings)
 
     def step(self, dt: float, settings: Settings | None = None) -> int:
-        """Rebuild, compute forces, then integrate once, unless the grid overflows."""
+        """Rebuild, compute forces, integrate and collide unless the grid overflows."""
         dt = _validate_time(dt, "time step")
         if not MIN_TIME_STEP <= dt <= MAX_TIME_STEP:
             raise ValueError("time step must be within the configured bounds")
@@ -106,11 +109,7 @@ class DynamicsSolver:
         return overflow
 
     def advance(self, frame_time: float, settings: Settings | None = None) -> int:
-        """Advance a bounded frame; zero playback speed leaves all fields alone.
-
-        This convenience method has no collision pass. Coordinators adding
-        collisions should own the substep loop and use compute_forces/integrate.
-        """
+        """Advance a bounded frame, colliding each step; zero speed leaves fields alone."""
         frame_time = _validate_time(frame_time, "frame time")
         if frame_time < 0:
             raise ValueError("frame time must be nonnegative")
