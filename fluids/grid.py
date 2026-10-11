@@ -77,6 +77,11 @@ class SpatialGrid:
         self._insert()
         return int(self.overflow_count[None])
 
+    def reset(self) -> None:
+        """Clear bins and invalidate neighbors after a scene reset, in place."""
+        self._validate_scene()
+        self._clear(self.particles.world.domain_min, self.particles.smoothing_radius)
+
     def run_substep(self, physics_step: Callable, *args, **kwargs) -> int:
         """Build before physics; return overflow without calling physics on failure."""
         overflow = self.build()
