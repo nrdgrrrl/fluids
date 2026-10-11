@@ -237,6 +237,11 @@ class ActionTests(unittest.TestCase):
         self.controls.handle_key(" ", True)
         self.assertFalse(self.simulation.paused)
         self.controls.handle_key("n", True)
+        self.simulation.step.assert_not_called()
+        self.controls.single_step()
+        self.simulation.step.assert_not_called()
+        self.controls.toggle_pause()
+        self.controls.single_step()
         self.simulation.step.assert_called_once_with(settings)
         self.controls.handle_key("w", True)
         self.simulation.launch_wave.assert_called_once_with(settings)
@@ -326,7 +331,8 @@ class ActionTests(unittest.TestCase):
         gui.slider_int.side_effect = lambda label, value, minimum, maximum: value
         gui.slider_float.side_effect = lambda label, value, minimum, maximum: value
         camera = Mock()
-        with patch.object(ti.ui, "Camera", return_value=camera):
+        with (patch.object(ti.ui, "Camera", return_value=camera),
+              patch("fluids.app.Application.warm_up")):
             controls = run_scene(self.window, self.simulation, self.renderer)
         self.assertTrue(controls.quit_requested)
         self.assertEqual(self.window.show.call_count, 2)
@@ -343,6 +349,7 @@ class ActionTests(unittest.TestCase):
         from fluids.simulation import SpatialGridOverflowError
 
         error = SpatialGridOverflowError(3)
+        self.simulation.paused = False
         self.simulation.advance.side_effect = error
         self.simulation.last_error = error
         self.simulation.particles.active_count = 100
@@ -360,7 +367,8 @@ class ActionTests(unittest.TestCase):
         gui.slider_int.side_effect = lambda label, value, minimum, maximum: value
         gui.slider_float.side_effect = lambda label, value, minimum, maximum: value
         camera = Mock()
-        with patch.object(ti.ui, "Camera", return_value=camera):
+        with (patch.object(ti.ui, "Camera", return_value=camera),
+              patch("fluids.app.Application.warm_up")):
             run_scene(self.window, self.simulation, self.renderer)
         self.assertTrue(self.simulation.paused)
         text = " ".join(call.args[0] for call in gui.text.call_args_list)
@@ -376,9 +384,9 @@ class ActionTests(unittest.TestCase):
             patch.dict(os.environ, {"DISPLAY": ":0"}),
             patch.object(bootstrap, "initialize_gpu"),
             patch.object(ti.ui, "Window", return_value=self.window),
-            patch("fluids.simulation.Simulation", return_value=self.simulation),
-            patch("fluids.rendering.Renderer", return_value=self.renderer),
-            patch("fluids.controls.run_scene", side_effect=KeyboardInterrupt),
+            patch("fluids.app.Simulation", return_value=self.simulation),
+            patch("fluids.app.Renderer", return_value=self.renderer),
+            patch("fluids.app.Application.run", side_effect=KeyboardInterrupt),
         ):
             self.assertEqual(main(), 130)
         self.window.destroy.assert_called_once_with()

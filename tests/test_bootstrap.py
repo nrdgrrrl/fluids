@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
-from fluids import bootstrap
+from fluids import app, bootstrap
 from fluids.__main__ import main
 
 
@@ -63,7 +63,7 @@ class BootstrapTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"TI_ARCH": "vulkan"}),
             patch.object(bootstrap.ti, "init", side_effect=error),
-            patch.object(bootstrap, "create_window") as create,
+            patch.object(app, "create_window") as create,
             contextlib.redirect_stderr(stderr),
         ):
             self.assertEqual(main(), 1)
@@ -76,7 +76,7 @@ class BootstrapTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"DISPLAY": ":0"}),
             patch.object(bootstrap, "initialize_gpu"),
-            patch.object(bootstrap, "VulkanWindow", side_effect=RuntimeError("GLFW unavailable")),
+            patch.object(app.ti.ui, "Window", side_effect=RuntimeError("GLFW unavailable")),
             contextlib.redirect_stderr(stderr),
         ):
             self.assertEqual(main(), 1)
@@ -99,9 +99,12 @@ class BootstrapTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"DISPLAY": ":0"}),
             patch.object(bootstrap, "initialize_gpu"),
-            patch.object(bootstrap, "VulkanWindow", return_value=window),
+            patch.object(app, "create_window", return_value=window),
+            patch.object(app, "Application") as application,
         ):
+            application.return_value.run.side_effect = window.show
             self.assertEqual(main(), 0)
+        application.assert_called_once_with(window)
         window.show.assert_called_once_with()
         window.destroy.assert_called_once_with()
 
@@ -110,8 +113,10 @@ class BootstrapTests(unittest.TestCase):
         window.show.side_effect = KeyboardInterrupt
         with (
             patch.object(bootstrap, "initialize_gpu"),
-            patch.object(bootstrap, "create_window", return_value=window),
+            patch.object(app, "create_window", return_value=window),
+            patch.object(app, "Application") as application,
         ):
+            application.return_value.run.side_effect = window.show
             self.assertEqual(main(), 130)
         window.destroy.assert_called_once_with()
 
