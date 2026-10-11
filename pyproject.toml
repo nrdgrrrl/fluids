@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluids"
+version = "0.1.0"
+description = "A native GPU coastal-wave sandbox"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = ["taichi==1.7.4", "numpy==1.26.4"]
+
+[project.scripts]
+fluids = "fluids.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["fluids*"]
