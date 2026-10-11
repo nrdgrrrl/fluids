@@ -8,6 +8,7 @@ the same way.
 import taichi as ti
 
 WINDOW_TITLE = 'Fluids — coastal wave sandbox'
+# Initial size only: the window is resizable, and the swap chain follows it.
 WINDOW_RESOLUTION = (1440, 900)
 
 VULKAN_ERROR = (
@@ -51,7 +52,19 @@ def initialize_gpu():
 
 
 def create_window():
-    """Open the resizable native window used to present the simulation."""
+    """Open the resizable native window used to present the simulation.
+
+    Resizing comes from the GGUI window itself, which is why no window
+    implementation of our own is needed to get it. In the pinned Taichi
+    1.7.4, ``create_glfw_window_`` (taichi/ui/utils/utils.h) sets only the
+    ``GLFW_VISIBLE`` and ``GLFW_CLIENT_API`` hints, so ``GLFW_RESIZABLE``
+    keeps its default of true and the user can drag the window edges;
+    ``vulkan::Window::init`` (taichi/ui/ggui/window.cpp) then registers a
+    framebuffer-size callback that recreates the Vulkan swap chain and its
+    depth and image resources, so frames keep presenting at the new size.
+    The canvas is bound to the renderer rather than to a swap chain image,
+    so callers may keep the object this window hands them across a resize.
+    """
     try:
         # Vsync limits unnecessary rendering work while physics has its own clock.
         return ti.ui.Window(WINDOW_TITLE, WINDOW_RESOLUTION, vsync=True)

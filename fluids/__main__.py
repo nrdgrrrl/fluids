@@ -42,6 +42,7 @@ def main(argv=None):
         print(f'fluids: {exc}', file=sys.stderr)
         return 1
 
+    # The canvas stays valid across a resize, so it is fetched once.
     canvas = window.get_canvas()
     # Keep the first checkpoint runnable before simulation modules are added.
     while window.running:

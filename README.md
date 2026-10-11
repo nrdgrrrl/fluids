@@ -30,6 +30,10 @@ fluids
 ```
 
 `fluids` opens the application window; closing the window exits the process.
+Dragging a window edge resizes it: Taichi's GGUI window recreates the Vulkan
+swap chain from its framebuffer-size callback, so frames keep presenting at
+the new size. That path needs a display, so confirm it on target hardware by
+dragging an edge while `fluids` runs.
 
 To check the GPU backend without opening a window:
 
@@ -50,5 +54,5 @@ pytest
 
 The tests cover packaging-independent behaviour — backend policy, error
 handling, and the entry point — against a Taichi stub, so they run without a
-GPU. GPU simulation and rendering can only be verified by running the
-application on target hardware.
+GPU. GPU simulation, rendering, and window resizing can only be verified by
+running the application on target hardware.
