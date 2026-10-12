@@ -18,7 +18,7 @@ Particle, bin, and collision fields are allocated once and reused on every reset
 
 from .config import DEFAULT_SETTINGS, MAX_FRAME_TIME, MAX_SUBSTEPS, MIN_TIME_STEP, Settings
 from .dynamics import DynamicsSolver, _validate_time
-from .grid import SpatialGrid
+from .grid import CELL_SIZE, SpatialGrid
 from .particles import PARTICLE_CAPACITY, ParticleState, plan_water_lattice
 from .world import generate_world
 
@@ -47,10 +47,11 @@ class Simulation:
 
     def __init__(
         self, settings: Settings = DEFAULT_SETTINGS, *, capacity: int = PARTICLE_CAPACITY,
+        grid_cell_size: float = CELL_SIZE,
     ) -> None:
         self.world = generate_world(settings)
         self.particles = ParticleState(settings, self.world, capacity=capacity)
-        self.grid = SpatialGrid(self.particles)
+        self.grid = SpatialGrid(self.particles, cell_size=grid_cell_size)
         self.dynamics = DynamicsSolver(self.grid)
         self.applied_settings = settings
         self._paused = False

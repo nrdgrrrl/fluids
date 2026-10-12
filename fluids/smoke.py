@@ -135,7 +135,7 @@ def run_checks(*, steps=120):
     # ten times on the same objects, including renderer geometry uploads.
     fields = _state_fields(sim) + (
         state.count, sim.grid.cell_counts, sim.grid.particle_indices, sim.grid.overflow_count,
-        sim.grid._origin, sim.grid._radius, sim.grid._ready, sim.dynamics._step_limit,
+        sim.grid._origin, sim.grid._radius, sim.grid._span, sim.grid._ready, sim.dynamics._step_limit,
         sim.dynamics.collisions.building_minimum, sim.dynamics.collisions.building_maximum,
         sim.dynamics.collisions.building_occupied,
         renderer.vertices, renderer.colors, renderer.normals, renderer.outline_vertices,
