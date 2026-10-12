@@ -234,6 +234,35 @@ class Controls:
         if name in ("reset_simulation", "new_city"):
             self.last_error = None
 
+    def _event_phase(self, event, window) -> str | None:
+        """Normalize a GGUI event's input phase to ``"Press"``/``"Release"``.
+
+        Taichi's GGUI ``Event`` reports its phase under ``type`` (an
+        ``EventType``: ``Press``/``Release``/``Move``); some bindings and mocks
+        instead carry the older ``action`` spelling. Accept either attribute,
+        as an enum or a plain string, and return ``None`` for motion or any
+        event class without a recognised phase so callers can skip it.
+
+        Taichi 1.7.x's GGUI ``Event`` exposes only ``key``; an untagged batch
+        is classified from the live ``is_pressed`` state so press/release still
+        dispatch instead of raising ``AttributeError``.
+        """
+        raw = getattr(event, "type", None)
+        if raw is None:
+            raw = getattr(event, "action", None)
+        if raw is not None:
+            name = getattr(raw, "name", None) or str(raw)
+            name = name.rsplit(".", 1)[-1].lower()
+            return {"press": "Press", "release": "Release"}.get(name)
+        key = getattr(event, "key", None)
+        if key is None:
+            return None
+        try:
+            pressed = window.is_pressed(key)
+        except Exception:
+            return None
+        return "Press" if pressed is True else "Release"
+
     def update(self, window) -> bool:
         """Consume GGUI press/release events, then update continuous mouse input."""
         events = iter(window.get_events())
@@ -242,28 +271,31 @@ class Controls:
         aspect_ratio = width / max(height, 1)
         try:
             for event in events:
-                if event.action in ("Press", "Release"):
-                    if event.key in ("LMB", "RMB"):
-                        if event.action == "Press":
-                            self._mouse_buttons.add(event.key)
-                        else:
-                            self._mouse_buttons.discard(event.key)
-                        # Observe releases even if another drag starts between two
-                        # frames, rather than inheriting the previous capture.
-                        self.camera.update_mouse(
-                            cursor, left_pressed="LMB" in self._mouse_buttons,
-                            right_pressed="RMB" in self._mouse_buttons,
-                            panel_rect=self.panel_rect, aspect_ratio=aspect_ratio,
-                        )
+                phase = self._event_phase(event, window)
+                if phase is None:
+                    continue
+                if event.key in ("LMB", "RMB"):
+                    if phase == "Press":
+                        self._mouse_buttons.add(event.key)
                     else:
-                        self.handle_key(event.key, event.action == "Press")
+                        self._mouse_buttons.discard(event.key)
+                    # Observe releases even if another drag starts between two
+                    # frames, rather than inheriting the previous capture.
+                    self.camera.update_mouse(
+                        cursor, left_pressed="LMB" in self._mouse_buttons,
+                        right_pressed="RMB" in self._mouse_buttons,
+                        panel_rect=self.panel_rect, aspect_ratio=aspect_ratio,
+                    )
+                else:
+                    self.handle_key(event.key, phase == "Press")
         finally:
             # GGUI consumed the whole batch. If an action failed, preserve its
             # remaining key releases before the error reaches the scene loop.
             for event in events:
-                if event.action == "Release" and event.key not in ("LMB", "RMB"):
+                phase = self._event_phase(event, window)
+                if phase == "Release" and event.key not in ("LMB", "RMB"):
                     self.handle_key(event.key, False)
-                elif event.action == "Press" and event.key.lower() == "escape":
+                elif phase == "Press" and event.key.lower() == "escape":
                     self.handle_key(event.key, True)
         self._mouse_buttons = {
             key for key in ("LMB", "RMB") if window.is_pressed(key)
