@@ -1,4 +1,4 @@
-"""Opt-in spatial-grid benchmark; never imported by the application.
+"""Opt-in spatial-grid and scalar-readback benchmark; never imported by the application.
 
 Stages synchronize every measured pass and evolve one adaptive step per sample.
 Native mode times the complete, unchanged Application.run loop, without extra
@@ -7,7 +7,7 @@ in alternating order. CPU results do not establish target-GPU performance.
 """
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from itertools import product
 import json
@@ -24,6 +24,49 @@ from .bootstrap import initialize_gpu
 from .config import SMOOTHING_LENGTH_FACTOR, Settings
 from .grid import CELL_SIZE
 from .simulation import Simulation
+
+
+@contextmanager
+def _count_scalar_reads(sim):
+    """Count actual host field reads without adding any GPU synchronization."""
+    fields = {"overflow": sim.grid.overflow_count, "timestep": sim.dynamics._step_limit}
+    reads = dict.fromkeys(fields, 0)
+    field_type = type(fields["timestep"])
+    original = field_type.__getitem__
+
+    def read(field, key):
+        for name, target in fields.items():
+            if field is target:
+                reads[name] += 1
+        return original(field, key)
+
+    with patch.object(field_type, "__getitem__", new=read):
+        yield reads
+
+
+@contextmanager
+def _timestep_read_mode(sim, mode):
+    """Duplicate control reproduces the old property read on every access."""
+    if mode == "cached":
+        yield
+        return
+    if mode != "duplicate":
+        raise ValueError("timestep read mode must be cached or duplicate")
+    solver_type = type(sim.dynamics)
+    original = solver_type.stable_time_step.fget
+
+    def uncached(solver):
+        solver._cached_step_limit = None
+        return original(solver)
+
+    with patch.object(solver_type, "stable_time_step", new=property(uncached)):
+        yield
+
+
+def _read_report(reads, substeps):
+    return {"counts": dict(reads), "total": sum(reads.values()),
+            "per_completed_substep": {name: count / substeps if substeps else None
+                                      for name, count in reads.items()}}
 
 
 def candidate_checks(counts, span=1):
@@ -74,7 +117,9 @@ def measure_stages(sim, *, steps=40, warmup_steps=8, presteps=0, wave=False):
     sampled = _candidates(sim)
     solver = sim.dynamics
     methods = ((sim.grid, "build", "grid"), (solver.density, "_compute", "density"),
-               (solver, "_compute_forces", "forces"), (solver, "_integrate", "integration"),
+               (solver, "_compute_forces", "forces"),
+               (solver, "_read_stable_time_step", "timestep_readback"),
+               (solver, "_integrate", "integration"),
                (solver.collisions, "resolve", "collisions"))
     timings = {label: [] for _, _, label in methods}
 
@@ -91,6 +136,7 @@ def measure_stages(sim, *, steps=40, warmup_steps=8, presteps=0, wave=False):
     simulated_start = sim.simulated_time
     total = []
     with ExitStack() as stack:
+        reads = stack.enter_context(_count_scalar_reads(sim))
         for owner, name, label in methods:
             stack.enter_context(patch.object(owner, name, new=timed(label, getattr(owner, name))))
         for _ in range(steps):
@@ -103,6 +149,7 @@ def measure_stages(sim, *, steps=40, warmup_steps=8, presteps=0, wave=False):
             "wave": wave, "stages": {name: _summary(values) for name, values in timings.items()},
             "diagnostic_substep": _summary(total),
             "simulated_seconds": sim.simulated_time - simulated_start,
+            "scalar_reads": _read_report(reads, steps),
             "native_frames": "unmeasured", "driver_memory": "unmeasured"}
 
 
@@ -137,6 +184,8 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
                 sample_start = now
                 simulated_start, discarded_start = sim.simulated_time, sim.discarded_time
                 accumulated_start, substeps_start = sim.accumulated_time, substeps
+                for name in reads:
+                    reads[name] = 0
         else:
             if warmup_until is None:
                 warmup_until = now + warmup_seconds  # Exclude the first presented frame.
@@ -170,7 +219,8 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
 
         with (patch.object(application, "warm_up", new=warm_up),
               patch.object(app, "monotonic", new=frame_clock),
-              patch.object(sim, "advance", new=advance)):
+              patch.object(sim, "advance", new=advance),
+              _count_scalar_reads(sim) as reads):
             application.run()
         if not frames:
             raise RuntimeError("Native run ended before collecting warmed frames")
@@ -182,11 +232,14 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
                 "sample_complete": stop, "sample_seconds": duration, "fps": len(frames) / duration,
                 "frame": _summary(frames), "physics_advance_wall": _summary(physics),
                 "simulated_seconds": sim.simulated_time - simulated_start,
+                "simulated_seconds_per_wall_second": (sim.simulated_time - simulated_start) / duration,
                 "discarded_seconds": sim.discarded_time - discarded_start,
                 "discarded_seconds_per_wall_second": (sim.discarded_time - discarded_start) / duration,
                 "accumulated_seconds_start": accumulated_start,
                 "accumulated_seconds_end": sim.accumulated_time,
-                "substeps": substeps - substeps_start, "driver_memory": "unmeasured"}
+                "substeps": substeps - substeps_start,
+                "scalar_reads": _read_report(reads, substeps - substeps_start),
+                "driver_memory": "unmeasured"}
     finally:
         window.destroy()
 
@@ -196,6 +249,8 @@ def main(argv=None):
     parser.add_argument("--mode", choices=("stages", "native"), default="stages")
     parser.add_argument("--backend", choices=("cpu", "vulkan"), default="vulkan")
     parser.add_argument("--layout", choices=("legacy", "fixed", "quality"), default="fixed")
+    parser.add_argument("--timestep-reads", choices=("cached", "duplicate"), default="cached",
+                        help="duplicate reproduces the previous uncached timestep readbacks")
     parser.add_argument("--quality", choices=("low", "medium", "high"), default="medium")
     parser.add_argument("--depth", type=float, default=2.0)
     parser.add_argument("--steps", type=int, default=40)
@@ -233,14 +288,16 @@ def main(argv=None):
                   "python": platform.python_version(), "taichi": ti.__version__,
                   "device_label": args.device_label, "driver": args.driver, "refresh_hz": args.refresh_hz,
                   "layout": args.layout, "cell_size_m": cell_size, "grid_shape": sim.grid.shape,
+                  "timestep_reads": args.timestep_reads,
                   "logical_grid_bytes": sim.grid.storage_bytes, "particles": sim.particles.active_count,
                   "physics_settings": asdict(settings)}
-        if args.mode == "native":
-            result = measure_native(sim, warmup_seconds=args.warmup_seconds,
-                                    sample_seconds=args.sample_seconds, scenario=args.scenario)
-        else:
-            result = measure_stages(sim, steps=args.steps, warmup_steps=args.warmup_steps,
-                                    presteps=args.presteps, wave=args.wave)
+        with _timestep_read_mode(sim, args.timestep_reads):
+            if args.mode == "native":
+                result = measure_native(sim, warmup_seconds=args.warmup_seconds,
+                                        sample_seconds=args.sample_seconds, scenario=args.scenario)
+            else:
+                result = measure_stages(sim, steps=args.steps, warmup_steps=args.warmup_steps,
+                                        presteps=args.presteps, wave=args.wave)
         report.update(result)
         print(json.dumps(report, indent=2))
     except (RuntimeError, ValueError, AssertionError, OSError) as exc:

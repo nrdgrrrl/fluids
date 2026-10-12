@@ -6,6 +6,7 @@ Particle readback is used only for assertions in this module.
 
 import os
 import unittest
+from contextlib import contextmanager
 from math import exp, pi, sqrt
 from unittest.mock import patch
 
@@ -73,6 +74,94 @@ class DynamicsTests(unittest.TestCase):
         self.state.velocities.from_numpy(speeds)
         self.state.count[None] = len(points)
         return points, speeds[:len(points)].copy()
+
+    @contextmanager
+    def limit_reads(self):
+        """Observe actual scalar field accesses, excluding device kernel reads."""
+        reads = []
+        field_type = type(self.solver._step_limit)
+        original = field_type.__getitem__
+
+        def read(field, key):
+            if field is self.solver._step_limit:
+                reads.append(key)
+            return original(field, key)
+
+        with patch.object(field_type, "__getitem__", new=read):
+            yield reads
+
+    def test_one_limit_read_per_snapshot_including_integration_validation(self):
+        self.upload([[-10, 4, 10]], [[40, 0, 0]])
+        with self.limit_reads() as reads:
+            self.assertEqual(self.solver.compute_forces(), 0)
+            self.assertEqual(reads, [])  # Force-only callers need no readback.
+            limit = self.solver.stable_time_step
+            self.assertEqual(self.solver.stable_time_step, limit)
+            positions = self.state.positions.to_numpy()
+            with self.assertRaisesRegex(ValueError, "stability limit"):
+                self.solver.integrate(MAX_TIME_STEP)
+            np.testing.assert_array_equal(self.state.positions.to_numpy(), positions)
+            self.solver.integrate(limit)
+            self.assertEqual(reads, [None])
+            self.assertIsNone(self.solver._cached_step_limit)
+            with self.assertRaisesRegex(RuntimeError, "compute_forces"):
+                self.solver.integrate(MIN_TIME_STEP)
+            self.assertEqual(reads, [None])
+            self.assertEqual(self.solver.compute_forces(), 0)
+            # A caller may integrate without first requesting the property.
+            self.solver.integrate(MIN_TIME_STEP)
+            self.assertEqual(reads, [None, None])
+
+    def test_reset_and_launch_invalidate_cached_limit_without_reading_it(self):
+        self.upload([[-10, 4, 10]])
+        for invalidate in (self.solver.reset, self.solver.launch_wave):
+            with self.subTest(invalidate=invalidate.__name__), self.limit_reads() as reads:
+                self.assertEqual(self.solver.compute_forces(), 0)
+                self.solver.stable_time_step
+                invalidate()
+                self.assertIsNone(self.solver._cached_step_limit)
+                with self.assertRaisesRegex(RuntimeError, "compute_forces"):
+                    self.solver.stable_time_step
+                with self.assertRaisesRegex(RuntimeError, "compute_forces"):
+                    self.solver.integrate(MIN_TIME_STEP)
+                self.assertEqual(reads, [None])
+                self.assertEqual(self.solver.compute_forces(), 0)
+                self.solver.integrate(MIN_TIME_STEP)
+                self.assertEqual(reads, [None, None])
+
+    def test_subsequent_preparation_replaces_cached_bound_and_failed_pass_invalidates_it(self):
+        self.upload([[-10, 4, 10]])
+        with self.limit_reads() as reads:
+            self.assertEqual(self.solver.compute_forces(), 0)
+            slow_limit = self.solver.stable_time_step
+            self.upload([[-10, 4, 10]], [[40, 0, 0]])
+            self.assertEqual(self.solver.compute_forces(), 0)
+            self.assertIsNone(self.solver._cached_step_limit)
+            fast_limit = self.solver.stable_time_step
+            self.assertLess(fast_limit, slow_limit)
+            with self.assertRaisesRegex(ValueError, "stability limit"):
+                self.solver.integrate(slow_limit)
+            self.assertEqual(reads, [None, None])
+            def fail_forces(*args):
+                raise RuntimeError("force failed")
+
+            with patch.object(self.solver, "_compute_forces", new=fail_forces):
+                with self.assertRaisesRegex(RuntimeError, "force failed"):
+                    self.solver.compute_forces()
+            self.assertIsNone(self.solver._cached_step_limit)
+            with self.assertRaisesRegex(RuntimeError, "compute_forces"):
+                self.solver.integrate(fast_limit)
+            self.assertEqual(reads, [None, None])
+
+    def test_nonfinite_limit_is_rejected_before_integration_and_not_cached(self):
+        self.upload([[-10, 4, 10]])
+        self.assertEqual(self.solver.compute_forces(), 0)
+        with patch.object(self.solver, "_integrate", side_effect=AssertionError("unsafe integration")):
+            for limit in (float("nan"), float("inf")):
+                self.solver._step_limit[None] = limit
+                with self.assertRaisesRegex(ValueError, "stability limit must be a finite number"):
+                    self.solver.integrate(MIN_TIME_STEP)
+                self.assertIsNone(self.solver._cached_step_limit)
 
     def test_gravity_falls_semi_implicitly_and_live_zero_gravity_stops_acceleration(self):
         points, _ = self.upload([[-10, 5, 10]])
@@ -252,6 +341,9 @@ class DynamicsTests(unittest.TestCase):
         np.testing.assert_array_equal(self.state.velocities[3], 0)
 
     def test_overflow_skips_all_dynamics_and_recovers_after_rebuild(self):
+        self.upload([[-10, 4, 10]])
+        self.assertEqual(self.solver.compute_forces(), 0)
+        self.solver.stable_time_step  # Overflow must invalidate a cached success.
         self.upload(np.tile([-10, 4, 10], (CELL_CAPACITY + 3, 1)))
         self.state.accelerations.fill(42)
         fields = (self.state.positions, self.state.velocities, self.state.accelerations,
@@ -261,6 +353,7 @@ class DynamicsTests(unittest.TestCase):
             self.assertEqual(self.solver.step(0.005), 3)
         for field, expected in zip(fields, before):
             np.testing.assert_array_equal(field.to_numpy(), expected)
+        self.assertIsNone(self.solver._cached_step_limit)
         with self.assertRaises(RuntimeError):
             self.solver.integrate(0.005)
         self.upload([[-10, 4, 10]])

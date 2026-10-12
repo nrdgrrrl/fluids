@@ -69,30 +69,46 @@ class DynamicsSolver:
         self.waves = WaveLauncher(self.particles)
         self._step_limit = ti.field(dtype=ti.f32, shape=())
         self._forces_ready = False
+        self._cached_step_limit: float | None = None
+
+    def _invalidate_forces(self) -> None:
+        self._forces_ready = False
+        self._cached_step_limit = None
 
     def reset(self) -> None:
         """Invalidate prepared forces and refresh geometry without allocation."""
-        self._forces_ready = False
+        self._invalidate_forces()
         self._step_limit[None] = MAX_TIME_STEP
         self.grid.reset()
         self.collisions.reset()
 
     def launch_wave(self, settings: Settings | None = None) -> None:
         """Add a live offshore impulse; recompute forces before integrating it."""
+        self._invalidate_forces()
         self.waves.launch(settings)
-        self._forces_ready = False
 
     @property
     def stable_time_step(self) -> float:
-        """Recommended maximum dt for the most recent successful force pass."""
+        """Validated maximum dt, read once per successful force snapshot.
+
+        Integration reuses this bound while still checking readiness and dt.
+        Cache lazily so callers that only prepare forces need no timestep read.
+        """
         if not self._forces_ready:
             raise RuntimeError("compute_forces must succeed before using the time-step limit")
-        return max(MIN_TIME_STEP, min(MAX_TIME_STEP, float(self._step_limit[None])))
+        if self._cached_step_limit is None:
+            self._cached_step_limit = self._read_stable_time_step()
+        return self._cached_step_limit
+
+    def _read_stable_time_step(self) -> float:
+        """Scalar readback boundary, also used by the opt-in stage benchmark."""
+        limit = _validate_time(float(self._step_limit[None]), "stability limit")
+        return max(MIN_TIME_STEP, min(MAX_TIME_STEP, limit))
 
     def compute_forces(self, settings: Settings | None = None) -> int:
         """Compute from one snapshot; leave all dynamics untouched on overflow."""
         settings = self.particles.settings if settings is None else settings
-        self._forces_ready = False
+        self._invalidate_forces()
         overflow = self.density.compute()
         if overflow == 0:
             self._compute_forces(
@@ -111,7 +127,7 @@ class DynamicsSolver:
             raise ValueError("time step exceeds the current stability limit")
         settings = self.particles.settings if settings is None else settings
         self._integrate(dt, settings.damping)
-        self._forces_ready = False
+        self._invalidate_forces()
         self.collisions.resolve(settings)
 
     def step(self, dt: float, settings: Settings | None = None) -> int:
