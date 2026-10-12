@@ -236,35 +236,51 @@ class Controls:
 
     def update(self, window) -> bool:
         """Consume GGUI press/release events, then update continuous mouse input."""
-        events = iter(window.get_events())
+        import taichi as ti
+
+        # Taichi 1.7.4's native GGUI Event exposes only key, without action
+        # or type. Ask the window to classify events using its public filters.
+        # Releases first let a new drag start without inheriting old capture.
+        events = iter([
+            *((event, False) for event in window.get_events(ti.ui.RELEASE)),
+            *((event, True) for event in window.get_events(ti.ui.PRESS)),
+        ])
         cursor = window.get_cursor_pos()
         width, height = window.get_window_shape()
         aspect_ratio = width / max(height, 1)
         try:
-            for event in events:
-                if event.action in ("Press", "Release"):
-                    if event.key in ("LMB", "RMB"):
-                        if event.action == "Press":
-                            self._mouse_buttons.add(event.key)
-                        else:
-                            self._mouse_buttons.discard(event.key)
-                        # Observe releases even if another drag starts between two
-                        # frames, rather than inheriting the previous capture.
-                        self.camera.update_mouse(
-                            cursor, left_pressed="LMB" in self._mouse_buttons,
-                            right_pressed="RMB" in self._mouse_buttons,
-                            panel_rect=self.panel_rect, aspect_ratio=aspect_ratio,
-                        )
+            for event, pressed in events:
+                key = getattr(event, "key", None)
+                if not isinstance(key, str):
+                    continue
+                if key in ("LMB", "RMB"):
+                    if pressed:
+                        self._mouse_buttons.add(key)
                     else:
-                        self.handle_key(event.key, event.action == "Press")
+                        self._mouse_buttons.discard(key)
+                    self.camera.update_mouse(
+                        cursor, left_pressed="LMB" in self._mouse_buttons,
+                        right_pressed="RMB" in self._mouse_buttons,
+                        panel_rect=self.panel_rect, aspect_ratio=aspect_ratio,
+                    )
+                else:
+                    if pressed:
+                        # GGUI queues GLFW_PRESS, never GLFW_REPEAT. Every
+                        # queued press is a new physical press, even when a
+                        # key was tapped several times between frames.
+                        self.handle_key(key, False)
+                    self.handle_key(key, pressed)
         finally:
-            # GGUI consumed the whole batch. If an action failed, preserve its
-            # remaining key releases before the error reaches the scene loop.
-            for event in events:
-                if event.action == "Release" and event.key not in ("LMB", "RMB"):
-                    self.handle_key(event.key, False)
-                elif event.action == "Press" and event.key.lower() == "escape":
-                    self.handle_key(event.key, True)
+            # GGUI consumed the whole batch. If an action failed, still honor
+            # Escape before the error reaches the scene loop.
+            for event, pressed in events:
+                key = getattr(event, "key", None)
+                if not isinstance(key, str):
+                    continue
+                if not pressed and key not in ("LMB", "RMB"):
+                    self.handle_key(key, False)
+                elif pressed and key.lower() == "escape":
+                    self.handle_key(key, True)
         self._mouse_buttons = {
             key for key in ("LMB", "RMB") if window.is_pressed(key)
         }

@@ -7,14 +7,16 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import taichi as ti
+from taichi._lib import core as ti_core
 
 from fluids.app import Application
 from fluids.config import Settings
 from fluids.simulation import Simulation, SpatialGridOverflowError
 
 
-def event(key):
-    return SimpleNamespace(key=key, action="Press")
+def event(key, pressed=True):
+    # Match the key-only native GGUI Event, with its kind supplied by a filter.
+    return (ti.ui.PRESS if pressed else ti.ui.RELEASE, Mock(spec_set=ti_core.Event, key=key))
 
 
 class AppTests(unittest.TestCase):
@@ -53,10 +55,29 @@ class AppTests(unittest.TestCase):
         self.enterContext(patch.object(ti.ui, "Camera", return_value=self.camera))
         self.app = Application(self.window, simulation=self.simulation, renderer=self.renderer)
 
+    def set_event_batches(self, batches):
+        self.window.get_events.side_effect = [
+            [item for kind, item in batch if kind is tag]
+            for batch in batches
+            for tag in (ti.ui.RELEASE, ti.ui.PRESS)
+        ]
+
     def run_frames(self, batches):
-        self.window.get_events.side_effect = [*batches, [event("Escape")]]
+        self.set_event_batches([*batches, [event("Escape")]])
         with patch.object(self.app, "warm_up"):
             self.app.run()
+
+    def test_first_panel_click_keeps_rendering_and_dispatches_button(self):
+        self.window.get_cursor_pos.return_value = (0.1, 0.8)
+        self.window.is_pressed.side_effect = lambda key: key == "LMB"
+        self.gui.button.side_effect = lambda label: label == "Pause (Space)"
+        self.run_frames([[event("LMB")]])
+        self.assertTrue(self.simulation.paused)
+        self.simulation.advance.assert_not_called()
+        self.renderer.render.assert_called_once()
+        self.window.show.assert_called_once()
+        self.assertEqual(self.app.controls.camera.azimuth,
+                         self.app.controls.camera.DEFAULT_AZIMUTH)
 
     def test_window_close_renders_complete_scene_and_keeps_paused_camera_responsive(self):
         self.simulation.paused = True
@@ -120,7 +141,7 @@ class AppTests(unittest.TestCase):
         error = SpatialGridOverflowError(7)
         self.simulation.advance.side_effect = [error, 0]
         self.run_frames([[], [event(" "), event("n")], [event("r")],
-                         [SimpleNamespace(key=" ", action="Release"), event(" ")]])
+                         [event(" ", False), event(" ")]])
         self.assertEqual(self.simulation.advance.call_count, 2)
         self.simulation.step.assert_not_called()
         self.simulation.reset.assert_called_once_with(self.settings)
@@ -147,7 +168,7 @@ class AppTests(unittest.TestCase):
         self.window.show.assert_not_called()
 
     def test_initial_render_compilation_is_excluded_from_playback_and_fps(self):
-        self.window.get_events.side_effect = [[], [], [], [event("Escape")]]
+        self.set_event_batches([[], [], [], [event("Escape")]])
         # First rendering takes 30 seconds; subsequent frames take 20 ms.
         with (patch.object(self.app, "warm_up"),
               patch("fluids.app.monotonic", side_effect=[100, 130, 130, 130.02,
