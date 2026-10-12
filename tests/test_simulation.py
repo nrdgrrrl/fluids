@@ -4,6 +4,7 @@ import os
 import unittest
 from math import sqrt
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import numpy as np
 import taichi as ti
@@ -23,7 +24,8 @@ class SimulationTests(unittest.TestCase):
             raise ValueError("FLUIDS_TEST_PARTICLE_ARCH must be cpu or vulkan")
         ti.init(arch=getattr(ti, arch), enable_fallback=False, offline_cache=False, debug=True)
         cls.settings = Settings(quality="low", water_depth=0.5, damping=0, viscosity=0)
-        cls.sim = Simulation(cls.settings, capacity=40_000)
+        # Kernel/step-sequence contracts must not depend on CPU execution speed.
+        cls.sim = Simulation(cls.settings, capacity=40_000, physics_work_budget=None)
 
     @classmethod
     def tearDownClass(cls):
@@ -44,6 +46,7 @@ class SimulationTests(unittest.TestCase):
         state.positions.from_numpy(positions)
         state.velocities.from_numpy(speeds)
         state.count[None] = len(points)
+        self.sim.dynamics._invalidate_forces()
 
     def test_reset_reproduces_world_and_water_and_reuses_all_gpu_fields(self):
         settings = self.settings.with_updates(city_seed=73)
@@ -276,6 +279,140 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(self.sim.simulated_time, 0)
         self.assertEqual(self.sim.discarded_time, 0)
         self.assertEqual(self.sim.accumulated_time, 0)
+
+    def test_fractional_frames_reuse_prepared_kernels_and_readbacks(self):
+        self.upload([[-10, 5, 10]])
+        with _count_scalar_reads(self.sim) as reads:
+            for _ in range(8):
+                self.assertEqual(self.sim.advance(0.001), 0)
+            self.assertEqual(reads, {"overflow": 1, "timestep": 1})
+            self.assertEqual(self.sim.advance(0.001), 1)
+        self.assertAlmostEqual(self.sim.simulated_time, MAX_TIME_STEP)
+        self.assertAlmostEqual(self.sim.accumulated_time, 0.009 - MAX_TIME_STEP)
+
+    def test_reused_snapshot_is_invalidated_by_settings_wave_reset_and_consumption(self):
+        self.upload([[-10, 5, 10]])
+        solver = self.sim.dynamics
+        with patch.object(solver, "compute_forces", wraps=solver.compute_forces) as prepare:
+            self.sim.advance(0.001)
+            self.sim.advance(0.001)
+            self.assertEqual(prepare.call_count, 1)
+            self.sim.advance(0.001, self.settings.with_updates(gravity=20))
+            self.assertEqual(prepare.call_count, 2)
+            self.sim.launch_wave()
+            self.sim.advance(0.001)
+            self.assertEqual(prepare.call_count, 3)
+            self.sim.step()
+            self.assertEqual(prepare.call_count, 3)  # Consume the same snapshot.
+            self.sim.advance(0.001)
+            self.assertEqual(prepare.call_count, 4)
+            self.sim.reset()
+            self.sim.advance(0.001)
+            self.assertEqual(prepare.call_count, 5)
+
+    def test_budgeted_frames_match_identical_unbudgeted_step_sequence(self):
+        results = []
+        live = self.settings.with_updates(gravity=0, damping=1)
+        try:
+            for budget in (None, 0.012):
+                self.sim.reset()
+                self.upload([[-10, 5, 10]], [[2, 0, 0]])
+                self.sim.physics_work_budget = budget
+                now = [0.0]
+
+                def complete():
+                    now[0] += 0.02
+
+                with (patch("fluids.simulation.perf_counter", side_effect=lambda: now[0]),
+                      patch("fluids.simulation.ti.sync", side_effect=complete),
+                      patch.object(self.sim.dynamics, "integrate", wraps=self.sim.dynamics.integrate) as integrate):
+                    for frame in ([0.05] if budget is None else [0.05] * 6):
+                        self.sim.advance(frame, live)
+                results.append(([call.args[0] for call in integrate.call_args_list],
+                                self.sim.particles.positions.to_numpy(),
+                                self.sim.particles.velocities.to_numpy(), self.sim.simulated_time))
+        finally:
+            self.sim.physics_work_budget = None
+        self.assertEqual(results[0][0], results[1][0])
+        self.assertEqual(results[0][3], results[1][3])
+        np.testing.assert_array_equal(results[0][1], results[1][1])
+        np.testing.assert_array_equal(results[0][2], results[1][2])
+
+
+class WorkBudgetTests(unittest.TestCase):
+    """Deterministic wall-clock scheduling tests, including queued GPU costs."""
+
+    def make_sim(self, *, prepare_cost=0.001, completion_cost=0.003, dt=MAX_TIME_STEP):
+        self.now = 0.0
+        self.sim = object.__new__(Simulation)
+        self.sim.physics_work_budget = 0.012
+        self.sim.applied_settings = Settings()
+        self.sim._paused = False
+        self.sim._clear_time()
+
+        def prepare(settings):
+            self.now += prepare_cost
+            return 0
+
+        def complete():
+            self.now += completion_cost
+
+        self.sim.dynamics = SimpleNamespace(prepare_forces=prepare, stable_time_step=dt,
+                                           integrate=lambda *args: None)
+        self.enterContext(patch("fluids.simulation.perf_counter", side_effect=lambda: self.now))
+        self.sync = self.enterContext(patch("fluids.simulation.ti.sync", side_effect=complete))
+        return self.sim
+
+    def test_budget_counts_completed_device_work_and_drops_backlog(self):
+        sim = self.make_sim()
+        self.assertEqual(sim.advance(0.1), 3)
+        self.assertEqual(self.sync.call_count, 3)
+        self.assertTrue(sim.last_budget_exhausted)
+        self.assertAlmostEqual(sim.last_physics_wall_time, 0.012)
+        self.assertEqual(sim.accumulated_time, 0)
+        self.assertAlmostEqual(sim.simulated_time + sim.discarded_time, 0.1)
+
+    def test_one_expensive_step_overruns_but_never_starts_another(self):
+        sim = self.make_sim(prepare_cost=0.03, completion_cost=0.004)
+        for speed in (1, 4):
+            live = sim.applied_settings.with_updates(playback_speed=speed, viscosity=1)
+            before = sim.simulated_time + sim.discarded_time
+            self.assertEqual(sim.advance(10, live), 1)
+            self.assertAlmostEqual(sim.last_physics_wall_time, 0.034)
+            self.assertTrue(sim.last_budget_exhausted)
+            self.assertEqual(sim.accumulated_time, 0)
+            self.assertAlmostEqual(sim.simulated_time + sim.discarded_time - before, 10 * speed)
+            self.assertEqual(sim.last_time_step, MAX_TIME_STEP)
+            self.assertEqual(sim.advance(0, live), 0)
+
+    def test_adaptive_small_steps_and_count_cap_remain_independent_limits(self):
+        sim = self.make_sim(prepare_cost=0, completion_cost=0, dt=1e-5)
+        self.assertEqual(sim.advance(0.1), MAX_SUBSTEPS)
+        self.assertEqual(sim.last_time_step, 1e-5)
+        self.assertFalse(sim.last_budget_exhausted)
+        self.assertEqual(sim.accumulated_time, 0)
+        self.assertAlmostEqual(sim.simulated_time + sim.discarded_time, 0.1)
+
+    def test_budget_discards_even_a_tiny_fractional_remainder(self):
+        sim = self.make_sim(prepare_cost=0.03, completion_cost=0)
+        self.assertEqual(sim.advance(MAX_TIME_STEP + 1e-6), 1)
+        self.assertTrue(sim.last_budget_exhausted)
+        self.assertEqual(sim.accumulated_time, 0)
+        self.assertAlmostEqual(sim.discarded_time, 1e-6)
+
+    def test_invalid_budgets_are_rejected_before_scene_allocation(self):
+        for budget in (0, -1, True, "0.012", float("inf"), float("nan")):
+            with self.subTest(budget=budget), self.assertRaises(ValueError):
+                Simulation(physics_work_budget=budget)
+
+    def test_pause_zero_speed_and_single_step_do_not_depend_on_budget(self):
+        sim = self.make_sim(prepare_cost=0.03)
+        sim.paused = True
+        self.assertEqual(sim.advance(100), 0)
+        self.assertEqual(sim.discarded_time, 0)
+        self.assertEqual(sim.step(sim.applied_settings.with_updates(playback_speed=0)), MAX_TIME_STEP)
+        self.assertEqual(sim.last_substeps, 1)
+        self.assertEqual(self.sync.call_count, 0)
 
 
 if __name__ == "__main__":

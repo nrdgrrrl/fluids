@@ -45,6 +45,8 @@ MIN_TIME_STEP = 1e-5
 MAX_TIME_STEP = 1.0 / 120.0
 MAX_FRAME_TIME = 0.1
 MAX_SUBSTEPS = 16
+# Wall-clock scheduling limit, independent of numerical timestep bounds.
+PHYSICS_WORK_BUDGET = 0.012
 CFL_FACTOR = 0.4
 MAX_SPEED = 50.0  # m/s; solver velocity cap
 MAX_ACCELERATION = 1000.0  # m/s^2; cap the magnitude of combined forces

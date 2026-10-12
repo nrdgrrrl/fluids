@@ -70,10 +70,12 @@ class DynamicsSolver:
         self._step_limit = ti.field(dtype=ti.f32, shape=())
         self._forces_ready = False
         self._cached_step_limit: float | None = None
+        self._force_settings: Settings | None = None
 
     def _invalidate_forces(self) -> None:
         self._forces_ready = False
         self._cached_step_limit = None
+        self._force_settings = None
 
     def reset(self) -> None:
         """Invalidate prepared forces and refresh geometry without allocation."""
@@ -116,7 +118,19 @@ class DynamicsSolver:
                 settings.viscosity, settings.gravity,
             )
             self._forces_ready = True
+            self._force_settings = settings
         return overflow
+
+    def prepare_forces(self, settings: Settings) -> int:
+        """Reuse an unconsumed snapshot when particle state and settings agree.
+
+        Integration, wave launch, reset and failed preparation invalidate it.
+        Direct field writers must call ``_invalidate_forces`` before reuse.
+        Explicit ``compute_forces`` continues to rebuild unconditionally.
+        """
+        if self._forces_ready and self._force_settings == settings:
+            return 0
+        return self.compute_forces(settings)
 
     def integrate(self, dt: float, settings: Settings | None = None) -> None:
         """Consume one force pass, rejecting oversized or unprepared steps."""

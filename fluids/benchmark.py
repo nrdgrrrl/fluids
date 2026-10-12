@@ -1,13 +1,15 @@
 """Opt-in spatial-grid and scalar-readback benchmark; never imported by the application.
 
 Stages synchronize every measured pass and evolve one adaptive step per sample.
-Native mode times the complete, unchanged Application.run loop, without extra
-GPU synchronization. Run each layout in a fresh process; compare several runs
+Native mode times the complete Application.run loop, without instrumentation
+GPU synchronization (the budgeted coordinator synchronizes completed steps).
+Run each layout in a fresh process; compare several runs
 in alternating order. CPU results do not establish target-GPU performance.
 """
 
 import argparse
 from contextlib import ExitStack, contextmanager
+from collections import deque
 from dataclasses import asdict
 from itertools import product
 import json
@@ -15,13 +17,14 @@ import platform
 from statistics import mean, median
 import sys
 from time import perf_counter
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import taichi as ti
 
 from .bootstrap import initialize_gpu
-from .config import SMOOTHING_LENGTH_FACTOR, Settings
+from .config import DEFAULT_SETTINGS, PHYSICS_WORK_BUDGET, SMOOTHING_LENGTH_FACTOR, Settings
 from .grid import CELL_SIZE
 from .simulation import Simulation
 
@@ -91,6 +94,7 @@ def candidate_checks(counts, span=1):
 def _summary(samples):
     return {"samples": len(samples), "mean_ms": 1000 * mean(samples),
             "median_ms": 1000 * median(samples),
+            "max_ms": 1000 * max(samples),
             "p95_ms": 1000 * float(np.percentile(samples, 95))}
 
 
@@ -153,15 +157,20 @@ def measure_stages(sim, *, steps=40, warmup_steps=8, presteps=0, wave=False):
             "native_frames": "unmeasured", "driver_memory": "unmeasured"}
 
 
-def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle"):
+def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle", input_probes=True):
     """Instrument Application's existing clock and advance call, preserving its loop."""
     from . import app
 
     window = app.create_window()
-    frames, physics = [], []
+    frames, physics, steps_per_frame, budget_hits = [], [], [], []
+    dispatch_latency, presentation_latency = [], []
+    pending_probes, dispatched_probes = deque(), []
+    next_probe = None
     started = warmup_until = sample_start = None
     simulated_start = discarded_start = accumulated_start = substeps_start = None
     last_physics = 0.0
+    last_steps = 0
+    last_budget_hit = False
     stop = False
     substeps = 0
 
@@ -173,13 +182,37 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
         def __getattr__(self, name):
             return getattr(window, name)
 
+        def get_events(self, tag):
+            nonlocal next_probe
+            events = list(window.get_events(tag))
+            if input_probes and sample_start is not None and tag == ti.ui.PRESS:
+                now = perf_counter()
+                if next_probe is None:
+                    next_probe = sample_start + 0.137
+                # Synthetic key arrivals at fixed wall-clock times; served by
+                # the real event/dispatch path. No driver or physical HID claim.
+                while next_probe <= now:
+                    pending_probes.append(next_probe)
+                    events.append(SimpleNamespace(key="0"))
+                    next_probe += 0.137
+            return events
+
+        def show(self):
+            window.show()
+            if dispatched_probes:
+                now = perf_counter()
+                presentation_latency.extend(now - timestamp for timestamp in dispatched_probes)
+                dispatched_probes.clear()
+
     def frame_clock():
-        nonlocal started, warmup_until, sample_start, stop, last_physics
+        nonlocal started, warmup_until, sample_start, stop, last_physics, last_steps, last_budget_hit
         nonlocal simulated_start, discarded_start, accumulated_start, substeps_start
         now = perf_counter()
         if started is None:
             started = now
             last_physics = 0.0
+            last_steps = 0
+            last_budget_hit = False
             if warmup_until is not None and now >= warmup_until and sample_start is None:
                 sample_start = now
                 simulated_start, discarded_start = sim.simulated_time, sim.discarded_time
@@ -192,6 +225,8 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
             elif sample_start is not None:
                 frames.append(now - started)
                 physics.append(last_physics)
+                steps_per_frame.append(last_steps)
+                budget_hits.append(last_budget_hit)
                 if now - sample_start >= sample_seconds:
                     stop = True
             started = None
@@ -200,16 +235,27 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
     original_advance = sim.advance
 
     def advance(*args, **kwargs):
-        nonlocal last_physics, substeps
+        nonlocal last_physics, substeps, last_steps, last_budget_hit
         begin = perf_counter()
         result = original_advance(*args, **kwargs)
         last_physics = perf_counter() - begin
         substeps += result
+        last_steps = result
+        last_budget_hit = bool(getattr(sim, "last_budget_exhausted", False))
         return result
 
     try:
         application = app.Application(WindowProxy(), simulation=sim)
         original_warm_up = application.warm_up
+        original_handle_key = application.controls.handle_key if input_probes else None
+
+        def handle_key(key, pressed):
+            result = original_handle_key(key, pressed)
+            if pressed and key == "0" and pending_probes:
+                timestamp = pending_probes.popleft()
+                dispatch_latency.append(perf_counter() - timestamp)
+                dispatched_probes.append(timestamp)
+            return result
 
         def warm_up():
             original_warm_up()
@@ -217,20 +263,37 @@ def measure_native(sim, *, warmup_seconds=8, sample_seconds=30, scenario="idle")
                 sim.launch_wave()
             sim.paused = scenario == "paused"
 
-        with (patch.object(application, "warm_up", new=warm_up),
-              patch.object(app, "monotonic", new=frame_clock),
-              patch.object(sim, "advance", new=advance),
-              _count_scalar_reads(sim) as reads):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(application, "warm_up", new=warm_up))
+            stack.enter_context(patch.object(app, "monotonic", new=frame_clock))
+            stack.enter_context(patch.object(sim, "advance", new=advance))
+            reads = stack.enter_context(_count_scalar_reads(sim))
+            if input_probes:
+                stack.enter_context(patch.object(application.controls, "handle_key", new=handle_key))
             application.run()
         if not frames:
             raise RuntimeError("Native run ended before collecting warmed frames")
         if application.controls.settings != sim.applied_settings or sim.last_error:
             raise RuntimeError("Settings changed or physics failed during the native benchmark")
         duration = sum(frames)
+        budget = getattr(sim, "physics_work_budget", None)
+        overruns = [max(0.0, elapsed - budget) for elapsed in physics] if budget is not None else []
         return {"kind": "complete_native_frames", "scenario": scenario,
                 "window_size": [1440, 900], "vsync": True, "warmup_seconds": warmup_seconds,
                 "sample_complete": stop, "sample_seconds": duration, "fps": len(frames) / duration,
                 "frame": _summary(frames), "physics_advance_wall": _summary(physics),
+                "physics_work_budget_ms": 1000 * budget if budget is not None else None,
+                "budget_exhausted_frames": sum(budget_hits),
+                "budget_overrun_frames": sum(overrun > 0 for overrun in overruns),
+                "budget_overrun_wall": _summary(overruns) if overruns else "disabled",
+                "steps_per_frame": {"mean": mean(steps_per_frame), "max": max(steps_per_frame),
+                                    "p95": float(np.percentile(steps_per_frame, 95))},
+                "input_latency": {
+                    "kind": "scheduled synthetic reset-view key; scheduled time to dispatch/show return",
+                    "dispatch": _summary(dispatch_latency) if dispatch_latency else "unmeasured",
+                    "presentation": _summary(presentation_latency) if presentation_latency else "unmeasured",
+                    "physical_hid_to_photon": "unmeasured",
+                },
                 "simulated_seconds": sim.simulated_time - simulated_start,
                 "simulated_seconds_per_wall_second": (sim.simulated_time - simulated_start) / duration,
                 "discarded_seconds": sim.discarded_time - discarded_start,
@@ -260,6 +323,10 @@ def main(argv=None):
     parser.add_argument("--scenario", choices=("idle", "wave", "paused"), default="idle")
     parser.add_argument("--warmup-seconds", type=float, default=8)
     parser.add_argument("--sample-seconds", type=float, default=30)
+    parser.add_argument("--physics-budget-ms", type=float, default=1000 * PHYSICS_WORK_BUDGET,
+                        help="positive wall-work budget; 0 reproduces the former count-only scheduler")
+    parser.add_argument("--playback-speed", type=float, default=1)
+    parser.add_argument("--viscosity", type=float, default=DEFAULT_SETTINGS.viscosity)
     parser.add_argument("--device-label", default="unrecorded", help="owner-supplied GPU/CPU model")
     parser.add_argument("--driver", default="unrecorded", help="owner-supplied driver version")
     parser.add_argument("--refresh-hz", type=float, help="owner-supplied desktop refresh rate")
@@ -273,8 +340,11 @@ def main(argv=None):
         parser.error("warmup-seconds must be finite and nonnegative; sample-seconds must be finite and positive")
     if args.mode == "native" and args.backend != "vulkan":
         parser.error("native frames require Vulkan without CPU fallback")
+    if not np.isfinite(args.physics_budget_ms) or args.physics_budget_ms < 0:
+        parser.error("physics-budget-ms must be finite and nonnegative")
     try:
-        settings = Settings(quality=args.quality, water_depth=args.depth)
+        settings = Settings(quality=args.quality, water_depth=args.depth,
+                            playback_speed=args.playback_speed, viscosity=args.viscosity)
         cell_size = {"legacy": 1.6, "fixed": CELL_SIZE,
                      "quality": settings.particle_spacing * SMOOTHING_LENGTH_FACTOR}[args.layout]
         if args.backend == "vulkan":
@@ -283,7 +353,8 @@ def main(argv=None):
             ti.init(arch=ti.cpu, enable_fallback=False, offline_cache=True)
             if ti.cfg.arch != ti.cpu:
                 raise RuntimeError("CPU benchmark selected a different backend; unset TI_ARCH")
-        sim = Simulation(settings, grid_cell_size=cell_size)
+        sim = Simulation(settings, grid_cell_size=cell_size,
+                         physics_work_budget=args.physics_budget_ms / 1000 or None)
         report = {"backend": str(ti.cfg.arch), "os": platform.platform(),
                   "python": platform.python_version(), "taichi": ti.__version__,
                   "device_label": args.device_label, "driver": args.driver, "refresh_hz": args.refresh_hz,

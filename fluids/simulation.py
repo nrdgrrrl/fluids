@@ -9,14 +9,21 @@ includes the entire paused interval. ``step(settings)`` advances exactly one
 adaptive physics timestep, even while paused or at zero playback speed.
 
 Only complete physics timesteps consume the accumulator. Fractional time carries
-between frames; frame spikes and work beyond MAX_SUBSTEPS are discarded and
-reported separately from simulated time. Catch SpatialGridOverflowError in the
+between frames; frame spikes and work beyond the wall budget or MAX_SUBSTEPS
+are discarded and reported separately from simulated time. Catch SpatialGridOverflowError in the
 UI and pause until the scene is repaired or reset. Failed substeps consume no
 simulation time and run no density, force, integration, or collision kernels.
 Particle, bin, and collision fields are allocated once and reused on every reset.
 """
 
-from .config import DEFAULT_SETTINGS, MAX_FRAME_TIME, MAX_SUBSTEPS, MIN_TIME_STEP, Settings
+from time import perf_counter
+
+import taichi as ti
+
+from .config import (
+    DEFAULT_SETTINGS, MAX_FRAME_TIME, MAX_SUBSTEPS, MIN_TIME_STEP,
+    PHYSICS_WORK_BUDGET, Settings,
+)
 from .dynamics import DynamicsSolver, _validate_time
 from .grid import CELL_SIZE, SpatialGrid
 from .particles import PARTICLE_CAPACITY, ParticleState, plan_water_lattice
@@ -48,7 +55,14 @@ class Simulation:
     def __init__(
         self, settings: Settings = DEFAULT_SETTINGS, *, capacity: int = PARTICLE_CAPACITY,
         grid_cell_size: float = CELL_SIZE,
+        physics_work_budget: float | None = PHYSICS_WORK_BUDGET,
     ) -> None:
+        if physics_work_budget is not None:
+            physics_work_budget = _validate_time(physics_work_budget, "physics work budget")
+            if physics_work_budget <= 0:
+                raise ValueError("physics work budget must be positive")
+        # None is an opt-in benchmark control for the former count-only loop.
+        self.physics_work_budget = physics_work_budget
         self.world = generate_world(settings)
         self.particles = ParticleState(settings, self.world, capacity=capacity)
         self.grid = SpatialGrid(self.particles, cell_size=grid_cell_size)
@@ -64,6 +78,8 @@ class Simulation:
         self.accumulated_time = 0.0
         self.last_time_step = 0.0
         self.last_substeps = 0
+        self.last_physics_wall_time = 0.0
+        self.last_budget_exhausted = False
         self.last_error: SpatialGridOverflowError | None = None
 
     @property
@@ -107,7 +123,7 @@ class Simulation:
     def _prepare_step(self, settings: Settings) -> float:
         # compute_forces owns grid -> density -> forces, and gates all physics
         # on the grid's scalar overflow result. No particle readback is needed.
-        overflow = self.dynamics.compute_forces(settings)
+        overflow = self.dynamics.prepare_forces(settings)
         if overflow:
             self._discard_backlog()
             self.last_error = SpatialGridOverflowError(overflow)
@@ -132,31 +148,54 @@ class Simulation:
         return dt
 
     def advance(self, frame_time: float, settings: Settings | None = None) -> int:
-        """Accumulate elapsed time and run at most MAX_SUBSTEPS complete steps.
+        """Run complete adaptive steps until the wall budget or step cap is hit.
 
         Timestep selection depends on physics, never the remaining frame time.
         At the work limit all remaining requested time is dropped, so overloaded
         frames visibly slow playback without accumulating a catch-up backlog.
+        The budget includes completed device work. A running step cannot be
+        preempted: wall work is bounded by the budget plus one indivisible
+        substep, not by a hard real-time deadline. No further step starts once
+        the deadline is reached. Single-step is independent of this budget.
         """
         frame_time = _validate_time(frame_time, "frame time")
         if frame_time < 0:
             raise ValueError("frame time must be nonnegative")
         settings = self.applied_settings if settings is None else settings
         self.last_substeps = 0
+        self.last_physics_wall_time = 0.0
+        self.last_budget_exhausted = False
         if self.paused or settings.playback_speed == 0:
             self._discard_backlog()
             return 0
         accepted_time = min(frame_time, MAX_FRAME_TIME)
         self.discarded_time += (frame_time - accepted_time) * settings.playback_speed
         self.accumulated_time += accepted_time * settings.playback_speed
-        for _ in range(MAX_SUBSTEPS):
-            if self.accumulated_time < MIN_TIME_STEP:
-                break
-            dt = self._prepare_step(settings)
-            if self.accumulated_time + 1e-12 < dt:
-                break
-            self._integrate(dt, settings)
-            self.accumulated_time = max(0.0, self.accumulated_time - dt)
-        if self.last_substeps == MAX_SUBSTEPS:
-            self._discard_backlog()
+        started = perf_counter()
+        try:
+            for _ in range(MAX_SUBSTEPS):
+                if self.accumulated_time < MIN_TIME_STEP:
+                    break
+                if (self.physics_work_budget is not None
+                        and perf_counter() - started >= self.physics_work_budget):
+                    self.last_budget_exhausted = True
+                    self._discard_backlog()
+                    break
+                dt = self._prepare_step(settings)
+                if self.accumulated_time + 1e-12 < dt:
+                    break
+                self._integrate(dt, settings)
+                self.accumulated_time = max(0.0, self.accumulated_time - dt)
+                if self.physics_work_budget is not None:
+                    # Scalar preparation reads wait for forces, but integration
+                    # and collisions would otherwise still be queued here.
+                    ti.sync()
+                    if perf_counter() - started >= self.physics_work_budget:
+                        self.last_budget_exhausted = True
+                        self._discard_backlog()
+                        break
+            if self.last_substeps == MAX_SUBSTEPS:
+                self._discard_backlog()
+        finally:
+            self.last_physics_wall_time = perf_counter() - started
         return self.last_substeps

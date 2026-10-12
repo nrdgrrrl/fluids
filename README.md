@@ -85,7 +85,9 @@ as leading digits and the last four digits.
 Playback speed scales requested simulation time. Zero stops integration; Space
 controls pause independently, and N still steps while paused at zero speed.
 The panel shows FPS, active particles, simulated time, substeps, discarded time,
-pending edits, and errors.
+actual simulated seconds per wall second, discarded seconds per wall second,
+requested playback speed, pending edits, and errors. Rates cover roughly the
+last wall second and include paused frames; requested speed is not achieved speed.
 
 If a spatial bin overflows, physics stops and the application pauses with an
 error. Camera, help, and settings remain usable. Lower quality or water depth
@@ -137,6 +139,108 @@ This command checks compute invariants, not rendering, coast arrival, or FPS.
 The existing optional `FLUIDS_TEST_NATIVE=1` test checks the legacy resizable
 GLFW/wgpu clear-window backend. It does not verify the application's GGUI scene.
 Software Vulkan/Xvfb results do not establish physical GPU performance.
+
+### Physics work budget and responsiveness (issue #39)
+
+The implementation target for the Intel UHD CML GT2 at 1440 × 900 with vsync is
+**at least 20 rendered/input-poll frames per second**, with **p95 scheduled
+input-to-dispatch latency at most 100 ms** and **p95 input-to-presentation-return
+latency at most 150 ms**, after warm-up. These are targets to verify on the
+owner's desktop, not measured results or a hard real-time guarantee. The paused
+27.1 FPS observation in the issue suggests roughly 37 ms of non-physics frame
+cost; a 12 ms physics budget leaves a nominal 50 ms frame envelope. A complete
+substep may exceed that budget, so meeting the target depends on its measured
+cost and the chosen quality. The target requires owner confirmation by measurement.
+
+`Simulation.advance` owns the deadline, elapsed-time accumulator and accounting.
+It starts no new substep after 12 ms of wall work, retains the separate 16-step
+safety cap, and drops remaining requested simulation time at either work limit.
+The 0.1 s accepted-frame limit and playback scaling still apply. Fractional time
+below the next adaptive dt carries across ordinary frames. Every completed dt
+remains within 10 µs–1/120 s and the acoustic, displacement, acceleration and
+viscosity stability limits; scheduling never enlarges dt. Requested time remains
+equal to completed simulated time + discarded time + the accumulator remainder.
+Paused wall time is not requested or discarded; reset clears all timing, and
+single-step consumes exactly one adaptive step independently of the budget.
+
+A substep is indivisible, and GPU kernels cannot be preempted here. The wall-work
+bound is **12 ms plus at most one substep's completion cost**, including dispatch,
+readback and synchronization, rather than a fixed upper latency for arbitrarily
+expensive settings or driver stalls. The coordinator calls `ti.sync()` after each
+integration/collision pass so its deadline accounts for completed GPU work,
+including the last step. It can then return to input/rendering after one expensive
+step instead of issuing another 12 or 16. Compilation is excluded by application
+warm-up. A frame spike or 4x playback cannot create an unbounded catch-up backlog.
+Overflow still gates all particle-writing passes before they run and discards
+pending time; the same pause/reset recovery applies.
+
+To avoid spending the budget repeatedly on unchanged state, the coordinator
+reuses an unconsumed force snapshot on fractional-time frames. This skips grid,
+density and force kernels and both scalar reads. Eight 1 ms frames below a
+1/120 s step now prepare once (one overflow + one timestep read), rather than
+eight times (16 scalar reads). Integration, reset, a wave, failed preparation
+or changed live settings invalidate reuse. Explicit solver `compute_forces`
+still rebuilds; callers that directly mutate particle fields must invalidate
+prepared forces. No asynchronous/device-side overflow or timestep path is added.
+For identical completed step sequences, scheduling preserves the physics result.
+
+Run the following on the Intel desktop in fresh processes, alternating order
+across repeats. Each report excludes compilation/first presentation, warms for
+8 seconds and samples at least 30 seconds. Budget `0` is the former count-only
+scheduler using the current kernels; it is not an old revision. Keep the fixed
+1.0 m grid and cached timestep reads for the comparison.
+
+```sh
+for budget in 0 12; do
+  for quality in medium low; do
+    python -m fluids.benchmark --mode native --quality "$quality" --scenario wave \
+      --physics-budget-ms "$budget" --warmup-seconds 8 --sample-seconds 30 \
+      --device-label 'Intel UHD Graphics (CML GT2, 8086:9b41)' \
+      --driver 'Mesa 25.2.8 / i915' --refresh-hz 59.96
+  done
+done
+# Stress the default budget with expensive settings and fast playback.
+python -m fluids.benchmark --mode native --quality high --depth 4 --scenario wave \
+  --playback-speed 4 --viscosity 1 --warmup-seconds 8 --sample-seconds 30 \
+  --device-label 'Intel UHD Graphics (CML GT2, 8086:9b41)' \
+  --driver 'Mesa 25.2.8 / i915' --refresh-hz 59.96
+```
+
+Use actual driver metadata, verify i915 render-engine activity, and avoid manual
+input/settings changes during sampling. The benchmark sends scheduled synthetic
+reset-view key probes every 137 ms through the controls' event/dispatch path;
+the default camera stays stationary. It reports schedule-to-dispatch and
+schedule-to-`window.show()`-return distributions, not physical HID-to-photon
+latency. No background timing thread or extra GPU synchronization is added by
+instrumentation. Native reports include FPS, mean/p95/max frame and physics work,
+mean/p95/max steps/frame, budget exhaustion counts, simulated seconds/wall second,
+budget overrun counts/distributions, discarded seconds and rate, accumulator
+endpoints, and actual scalar reads.
+Also test pause, single-step, reset, wave launch and overflow recovery manually,
+and briefly stall/drag the window to evaluate frame spikes and camera response.
+
+Record all metrics together; FPS improvement alone does not establish success:
+
+| Warmed 30 s wave scenario | FPS | Input dispatch/presentation p95 | Steps/frame | Sim s/wall s | Discarded s (s/wall s) |
+| --- | --- | --- | --- | --- | --- |
+| Intel medium, 12 ms budget | unmeasured | unmeasured | unmeasured | unmeasured | unmeasured |
+| Intel low, 12 ms budget | unmeasured | unmeasured | unmeasured | unmeasured | unmeasured |
+
+This container has no `/dev/dri`, Vulkan ICD or `DISPLAY`; it cannot establish
+native FPS, input latency or Intel simulation/discard rates. Controlled-clock
+tests establish deadline enforcement including queued completion cost, at most
+one expensive step beyond the deadline, bounded backlog under 4x playback and
+10 s spikes, preserved small adaptive steps, accounting and identical physics
+for identical step sequences. CPU kernel tests establish snapshot read savings,
+invalidation and existing recovery contracts, not target-GPU performance.
+
+The default quality remains medium pending target measurements. Prefer low on
+the Intel machine if medium misses the cadence/latency targets and low meets
+them with better simulation progress. Compare throughput and discard rates with
+both count-only controls: the render budget can slow simulation even as controls
+improve. If neither quality meets the targets, record the overrun distribution
+and slower rate rather than claiming success or increasing numerical dt. A
+future split-pass scheduler would be needed if one substep remains too expensive.
 
 ### Device vertex staging (issue #37)
 
@@ -459,7 +563,8 @@ are **unmeasured** and remain owner checks before merging.
   fits these 1.0 m bins (at most 64 particles per cell); compression can still
   overflow a cell and stop physics before any particle fields are changed.
 - Physics uses adaptive timesteps between 10 µs and 1/120 s, accepts at most
-  0.1 s of each frame and runs at most 16 substeps. Excess requested time is
+  0.1 s of each frame, runs at most 16 substeps, and checks a 12 ms wall-work
+  deadline between completed steps (with one indivisible-step overrun). Excess requested time is
   discarded rather than integrated in an unsafe large step. High quality,
   deep water, fast waves, high viscosity, or fast playback can reduce effective
   simulation speed. Real interaction and performance depend on GPU and driver.
