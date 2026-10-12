@@ -5,10 +5,18 @@ import unittest
 from contextlib import nullcontext
 from math import cos, dist, isfinite, sin
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
+
+import taichi as ti
+from taichi._lib import core as ti_core
 
 from fluids.config import Settings
 from fluids.controls import ACTIONS, PANEL_RECT, CameraController, Controls, PanelRect, main, run_scene
+
+
+def event(key, pressed=True):
+    # Native GGUI events expose key only; the filter supplies the event kind.
+    return (ti.ui.PRESS if pressed else ti.ui.RELEASE, Mock(spec_set=ti_core.Event, key=key))
 
 
 class CameraTests(unittest.TestCase):
@@ -131,10 +139,56 @@ class ActionTests(unittest.TestCase):
         self.renderer = Mock()
         self.controls = Controls(self.simulation, renderer=self.renderer)
         self.window = Mock()
-        self.window.get_events.return_value = []
+        self.events = []
+        self.window.get_events.side_effect = (
+            lambda tag: [item for kind, item in self.events if kind is tag]
+        )
         self.window.get_window_shape.return_value = (1440, 900)
         self.window.get_cursor_pos.return_value = (0.7, 0.5)
         self.window.is_pressed.return_value = False
+
+    def test_real_ggui_window_filters_key_only_events(self):
+        # Exercise Taichi's Python wrapper without creating GPU/window resources.
+        window = object.__new__(ti.ui.Window)
+        window.window = Mock()
+        window.window.get_events.side_effect = [[], [event("w")[1]]]
+        self.window.get_events.side_effect = window.get_events
+
+        self.assertTrue(self.controls.update(self.window))
+        self.simulation.launch_wave.assert_called_once_with(self.settings)
+        window.window.get_events.assert_has_calls([
+            call(ti_core.EventType.Release), call(ti_core.EventType.Press),
+        ])
+
+    def test_first_mouse_press_drag_and_release(self):
+        for button in ("LMB", "RMB"):
+            with self.subTest(button=button):
+                self.controls.camera.reset()
+                self.window.get_cursor_pos.return_value = (0.7, 0.5)
+                self.window.is_pressed.side_effect = lambda key: key == button
+                self.events = [event(button)]
+                self.assertTrue(self.controls.update(self.window))
+
+                self.events = []
+                self.window.get_cursor_pos.return_value = (0.8, 0.6)
+                self.assertTrue(self.controls.update(self.window))
+                camera = self.controls.camera
+                if button == "LMB":
+                    self.assertNotEqual(camera.azimuth, camera.DEFAULT_AZIMUTH)
+                    self.assertEqual(camera.target, camera.DEFAULT_TARGET)
+                else:
+                    self.assertNotEqual(camera.target, camera.DEFAULT_TARGET)
+                    self.assertEqual(camera.azimuth, camera.DEFAULT_AZIMUTH)
+
+                self.events = [event(button, False)]
+                self.window.is_pressed.side_effect = None
+                self.assertTrue(self.controls.update(self.window))
+                view = camera.target, camera.azimuth, camera.elevation
+                self.events = []
+                self.window.get_cursor_pos.return_value = (0.9, 0.7)
+                self.controls.update(self.window)
+                self.assertEqual(view, (camera.target, camera.azimuth, camera.elevation))
+        self.simulation.advance.assert_not_called()
 
     def test_documented_keys_dispatch_and_help_comes_from_action_metadata(self):
         for action in ACTIONS:
@@ -148,22 +202,24 @@ class ActionTests(unittest.TestCase):
         for action in ACTIONS:
             self.assertIn(f"{action.shortcut}: {action.description}", help_lines)
 
-    def test_holding_wave_key_never_launches_per_frame_or_on_repeat(self):
-        press = SimpleNamespace(key="w", action="Press")
-        self.window.get_events.return_value = [press]
+    def test_holding_wave_key_never_launches_per_frame(self):
+        press = event("w")
+        self.events = [press]
+        self.controls.update(self.window)
+        self.events = []
         for _ in range(50):
             self.controls.update(self.window)
         self.simulation.launch_wave.assert_called_once_with(self.settings)
-        self.window.get_events.return_value = [SimpleNamespace(key="w", action="Release"), press]
+        self.events = [event("w", False), press]
         self.controls.update(self.window)
         self.assertEqual(self.simulation.launch_wave.call_count, 2)
 
     def test_fast_press_and_release_between_frames_is_dispatched(self):
-        self.window.get_events.return_value = [
-            SimpleNamespace(key="w", action="Press"),
-            SimpleNamespace(key="w", action="Release"),
-            SimpleNamespace(key="w", action="Press"),
-            SimpleNamespace(key="w", action="Release"),
+        self.events = [
+            event("w"),
+            event("w", False),
+            event("w"),
+            event("w", False),
         ]
         self.controls.update(self.window)
         self.assertEqual(self.simulation.launch_wave.call_count, 2)
@@ -185,12 +241,12 @@ class ActionTests(unittest.TestCase):
         self.controls.handle_key("w", True)
         error = SpatialGridOverflowError(3)
         self.simulation.step.side_effect = error
-        self.window.get_events.return_value = [
-            SimpleNamespace(key="n", action="Press"),
-            SimpleNamespace(key="N", action="Release"),
-            SimpleNamespace(key="w", action="Release"),
-            SimpleNamespace(key="c", action="Press"),
-            SimpleNamespace(key="c", action="Release"),
+        self.events = [
+            event("n"),
+            event("N", False),
+            event("w", False),
+            event("c"),
+            event("c", False),
         ]
         with self.assertRaises(SpatialGridOverflowError) as raised:
             self.controls.update(self.window)
@@ -198,20 +254,21 @@ class ActionTests(unittest.TestCase):
         self.simulation.step.assert_called_once_with(self.settings)
         self.simulation.reset.assert_not_called()
 
-        self.window.get_events.return_value = [
-            SimpleNamespace(key="r", action="Press"),
-            SimpleNamespace(key="r", action="Release"),
+        self.events = [
+            event("r"),
+            event("r", False),
         ]
         self.controls.update(self.window)
         self.simulation.reset.assert_called_once_with(self.settings)
         self.simulation.step.side_effect = None
-        self.window.get_events.return_value = [
-            SimpleNamespace(key="n", action="Press"),
-            SimpleNamespace(key="w", action="Press"),
+        self.events = [
+            event("n"),
+            event("w"),
         ]
         self.controls.update(self.window)
         self.assertEqual(self.simulation.step.call_count, 2)
         self.assertEqual(self.simulation.launch_wave.call_count, 2)
+        self.events = []
         self.controls.update(self.window)
         self.assertEqual(self.simulation.step.call_count, 2)
         self.assertEqual(self.simulation.launch_wave.call_count, 2)
@@ -221,7 +278,7 @@ class ActionTests(unittest.TestCase):
         self.controls.update(self.window)
         target = self.controls.camera.target
         self.window.get_cursor_pos.return_value = (0.8, 0.6)
-        self.window.get_events.return_value = [SimpleNamespace(key="=", action="Press")]
+        self.events = [event("=")]
         self.controls.update(self.window)
         self.assertNotEqual(target, self.controls.camera.target)
         self.assertLess(self.controls.camera.distance, self.controls.camera.DEFAULT_DISTANCE)
@@ -274,15 +331,32 @@ class ActionTests(unittest.TestCase):
         gui = Mock()
         self.controls.draw_help(gui)
         self.assertEqual(gui.text.call_count, 1)
-        self.window.get_events.return_value = [SimpleNamespace(key="Escape", action="Press")]
+        self.events = [event("Escape")]
         self.assertFalse(self.controls.update(self.window))
         self.assertFalse(self.window.running)
 
-    def test_unknown_keys_and_motion_events_have_no_actions(self):
+    def test_unknown_keys_and_events_without_keys_have_no_actions(self):
         self.assertIsNone(self.controls.handle_key("unknown", True))
-        self.window.get_events.return_value = [SimpleNamespace(key="w", action="Motion")]
+        self.events = [
+            event("unknown"),
+            (ti.ui.PRESS, SimpleNamespace(pos=(0.5, 0.5))),
+            (ti.ui.RELEASE, SimpleNamespace(pos=(0.5, 0.5))),
+        ]
         self.controls.update(self.window)
         self.simulation.launch_wave.assert_not_called()
+
+    def test_error_cleanup_ignores_keyless_events_and_honors_escape(self):
+        error = ValueError("capacity")
+        self.simulation.reset.side_effect = error
+        self.events = [
+            event("r"),
+            (ti.ui.PRESS, SimpleNamespace(pos=(0.5, 0.5))),
+            event("Escape"),
+        ]
+        with self.assertRaises(ValueError) as raised:
+            self.controls.update(self.window)
+        self.assertIs(raised.exception, error)
+        self.assertTrue(self.controls.quit_requested)
 
     def test_custom_panel_is_used_for_both_ui_and_mouse_capture(self):
         rect = PanelRect(0.6, 0.2, 0.3, 0.6)
@@ -299,15 +373,15 @@ class ActionTests(unittest.TestCase):
     def test_release_and_new_drag_between_frames_does_not_inherit_panel_capture(self):
         self.window.is_pressed.side_effect = lambda key: key == "LMB"
         self.window.get_cursor_pos.return_value = (0.1, 0.8)
-        self.window.get_events.return_value = [SimpleNamespace(key="LMB", action="Press")]
+        self.events = [event("LMB")]
         self.controls.update(self.window)
         self.window.get_cursor_pos.return_value = (0.7, 0.5)
-        self.window.get_events.return_value = [
-            SimpleNamespace(key="LMB", action="Release"),
-            SimpleNamespace(key="LMB", action="Press"),
+        self.events = [
+            event("LMB", False),
+            event("LMB"),
         ]
         self.controls.update(self.window)
-        self.window.get_events.return_value = []
+        self.events = []
         self.window.get_cursor_pos.return_value = (0.8, 0.6)
         self.controls.update(self.window)
         self.assertNotEqual(self.controls.camera.azimuth, self.controls.camera.DEFAULT_AZIMUTH)
@@ -322,7 +396,7 @@ class ActionTests(unittest.TestCase):
         self.simulation.requires_reset.return_value = False
         self.window.running = True
         self.window.get_events.side_effect = [
-            [], [], [SimpleNamespace(key="Escape", action="Press")],
+            [], [], [], [], [], [event("Escape")[1]],
         ]
         gui = self.window.get_gui.return_value
         gui.sub_window.side_effect = lambda *args: nullcontext(gui)
@@ -358,7 +432,7 @@ class ActionTests(unittest.TestCase):
         self.simulation.requires_reset.return_value = False
         self.window.running = True
         self.window.get_events.side_effect = [
-            [], [SimpleNamespace(key="Escape", action="Press")],
+            [], [], [], [event("Escape")[1]],
         ]
         gui = self.window.get_gui.return_value
         gui.sub_window.side_effect = lambda *args: nullcontext(gui)
