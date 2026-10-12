@@ -439,6 +439,62 @@ GPU device, Vulkan ICD, or `DISPLAY`. Target Intel GPU stage timings, native
 frames/FPS, simulated/discarded time trends, driver memory, and visual acceptance
 are **unmeasured** and remain owner checks before merging.
 
+## One-command graphical acceptance (issues #36–#39)
+
+From a fresh checkout with the documented Python 3.11 venv activated, run:
+
+```sh
+python -m fluids.acceptance
+```
+
+`fluids-acceptance` is the equivalent installed console script. Run on the real
+Linux desktop with X11/XWayland `DISPLAY`, a physical GPU device under `/dev/dri`,
+and the vendor's Vulkan driver. The runner reads the installed system graphics
+tools (`vulkaninfo --summary`, `xrandr --current`, and optionally `glxinfo -B`);
+it downloads nothing and adds no Python dependencies. Missing required tools or
+unknown GPU/driver/refresh metadata stop the pass with an actionable diagnostic.
+Software renderers (`llvmpipe`, `lavapipe`, `softpipe`, `swrast`) are refused.
+If Vulkan exposes multiple devices, select the physical GPU's ICD using
+`VK_DRIVER_FILES` or `VK_ICD_FILENAMES`. Use a single active display or the same
+refresh rate on all active displays so the report's refresh label is unambiguous.
+
+The default pass runs all currently documented harness cases in fresh processes:
+issue #36's legacy/fixed/quality grids × idle/wave/paused native frames and its
+Vulkan stage comparisons; issue #37's stock/device staging × paused/active/wave,
+with PNG captures and ten water/city resets per case; and issue #38's
+duplicate/cached readbacks × idle/wave/paused at medium quality, low-quality wave
+frames, and Vulkan stage comparisons. Every graphical case excludes compilation,
+the first frame and eight seconds of warm-up, then samples at least 30 seconds.
+Synchronized stages retain their existing eight-step warm-up and 40-step sample
+and are labelled separately: they do not measure graphical FPS. No issue #39
+harness is documented in this checkout; it is explicitly reported as skipped.
+
+There are 23 graphical cases (about 15 minutes of warm-up/sampling alone) plus
+ten stage diagnostics and reset sweeps. Budget roughly **30–60 minutes**, depending
+on GPU speed and fresh-process compilation. **Do not use the mouse or keyboard
+while the runner is running**; input can invalidate the comparisons.
+`python -m fluids.acceptance --only 37` reruns just one issue (36, 37 or 38).
+`--only 39` reports the unavailable harness as skipped and exits nonzero.
+Optionally add `--with-checks`, from the repository root, to first run the focused
+and full CPU unittest tiers and windowless Vulkan smoke. These prerequisites are
+explicitly **non-performance**; their results never count as graphical evidence.
+
+Reports, raw tool evidence, per-process stdout/stderr logs, PNGs, a manifest and
+`summary.txt` go into one new `fluids-acceptance-...` directory in the current
+directory. `--results PATH` chooses a new directory; existing directories are
+refused to prevent mixing runs. The runner packages that directory into one ZIP
+and prints its path, including on preflight refusal or interrupted/failed runs.
+Stdout ends with copyable plain text: each measured graphical case's FPS, mean
+frame time, sampled simulated/discarded time and harness counters, with failed
+and skipped cases identified explicitly. Failures exit nonzero; individual case
+failures preserve logs and allow the remaining cases to run.
+
+PNG comparison and the existing manual interaction pass remain human checks.
+Driver GPU memory and render-engine activity also still need owner observation;
+process RSS and logical buffer sizes do not establish GPU memory consumption.
+Graphical execution in the headless implementation container is
+**unexecuted/unmeasured**; mocked runner tests do not supply performance evidence.
+
 ## Approximation and resource limits
 
 - Water uses weakly compressible SPH, an artificial 20 m/s sound speed,
