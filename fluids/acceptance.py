@@ -132,11 +132,11 @@ def probe_issue_39(directory):
     return None
 
 
-def build_cases(only=None, *, issue_39_available=True):
-    """All cases in the checked-in README, keeping harness flags unchanged."""
+def build_cases(only=None, *, issue_39_available=True, full=False, warmup_seconds=8, sample_seconds=30):
+    """Minimal comparisons by default; --full retains the documented matrices."""
     cases = []
-    native = ("--mode", "native", "--backend", "vulkan", "--warmup-seconds", "8",
-              "--sample-seconds", "30")
+    native = ("--mode", "native", "--backend", "vulkan", "--warmup-seconds", f"{warmup_seconds:g}",
+              "--sample-seconds", f"{sample_seconds:g}")
     stages = ("--backend", "vulkan", "--steps", "40", "--warmup-steps", "8")
     for layout in ("legacy", "fixed", "quality"):
         for scenario in ("idle", "wave", "paused"):
@@ -150,7 +150,8 @@ def build_cases(only=None, *, issue_39_available=True):
         for staging in ("stock", "device"):
             cases.append(Case(f"37-{staging}-{scenario}", 37, "fluids.render_benchmark",
                               ("--staging", staging, "--scenario", scenario, "--quality", "medium",
-                               "--warmup", "8", "--seconds", "30", "--resets", "10"), capture=True))
+                               "--warmup", f"{warmup_seconds:g}", "--seconds", f"{sample_seconds:g}",
+                               "--resets", "10" if full else "0"), capture=True))
     for reads in ("duplicate", "cached"):
         for scenario, quality in (("idle", "medium"), ("wave", "medium"), ("paused", "medium"),
                                   ("wave", "low")):
@@ -171,7 +172,52 @@ def build_cases(only=None, *, issue_39_available=True):
                 cases.append(Case(f"39-budget-{budget}-stages-{'wave' if wave else 'idle'}", 39,
                                   "fluids.benchmark", stages + budget_flags +
                                   (("--wave", "--presteps", "120") if wave else ()), graphical=False))
-    return [case for case in cases if only is None or case.issue == only]
+    default_names = {
+        "36-legacy-idle", "36-fixed-idle", "36-fixed-wave",
+        "38-duplicate-medium-idle", "38-cached-medium-idle",
+        "37-stock-paused", "37-device-paused", "37-device-active",
+        "39-budget-12-medium-wave", "39-budget-0-medium-wave",
+    }
+    return [case for case in cases if (only is None or case.issue == only)
+            and (full or case.name in default_names)]
+
+
+def graphical_window(case):
+    warmup_flag, sample_flag = (("--warmup", "--seconds") if case.capture
+                                else ("--warmup-seconds", "--sample-seconds"))
+    return (float(case.flags[case.flags.index(warmup_flag) + 1]),
+            float(case.flags[case.flags.index(sample_flag) + 1]))
+
+
+def reset_count(case):
+    return int(case.flags[case.flags.index("--resets") + 1]) if case.capture else 0
+
+
+def plan_cases(cases):
+    """Unmeasured planning allowances, summed from the actual selected cases.
+
+    Allow 20–60s per graphical process for startup/compilation, 30–90s per
+    synchronized diagnostic, and 2–15s per reset. Hardware can exceed these.
+    Optional correctness checks and preflight are outside this estimate.
+    """
+    graphical = sum(case.graphical for case in cases)
+    diagnostics = len(cases) - graphical
+    resets = sum(reset_count(case) for case in cases)
+    window_seconds = sum(sum(graphical_window(case)) for case in cases if case.graphical)
+    return {"cases": len(cases), "graphical": graphical, "diagnostics": diagnostics, "resets": resets,
+            "window_seconds": window_seconds,
+            "estimated_min_seconds": window_seconds + 20 * graphical + 30 * diagnostics + 2 * resets,
+            "estimated_max_seconds": window_seconds + 60 * graphical + 90 * diagnostics + 15 * resets}
+
+
+def format_plan(plan, full):
+    return (f"Planned {'full' if full else 'default'} profile: {plan['cases']} cases "
+            f"({plan['graphical']} graphical, {plan['diagnostics']} stage diagnostics), "
+            f"{plan['resets']} resets. Warm-up/sampling alone: {plan['window_seconds'] / 60:.1f} min. "
+            f"Estimated duration: {plan['estimated_min_seconds'] / 60:.1f}–"
+            f"{plan['estimated_max_seconds'] / 60:.1f} min, derived from the selected case list "
+            "with unmeasured startup/compilation, diagnostic and reset allowances; "
+            "GPU-dependent, excludes preflight and --with-checks.")
 
 
 def case_command(case, hardware, directory):
@@ -197,7 +243,7 @@ def read_report(stdout):
 
 
 def validate_report(case, report):
-    """Early window closure is not a successful 30-second graphical measurement."""
+    """Require the requested window and reset count, including quick re-checks."""
     if not case.graphical:
         if report.get("kind") != "synchronized_evolving_stages":
             raise ValueError("Expected a synchronized stage diagnostic")
@@ -210,8 +256,8 @@ def validate_report(case, report):
             for key in ("simulated_seconds", "discarded_seconds"):
                 if not isfinite(report[boundary][key]):
                     raise ValueError("Non-finite simulation counters")
-        if len(report["water_city_resets"]) != 10:
-            raise ValueError("Ten-reset sweep did not complete")
+        if len(report["water_city_resets"]) != reset_count(case):
+            raise ValueError("Requested reset sweep did not complete")
     else:
         timing = report
         warmup = report["warmup_seconds"]
@@ -221,9 +267,12 @@ def validate_report(case, report):
         for key in ("simulated_seconds", "discarded_seconds"):
             if not isfinite(report[key]):
                 raise ValueError("Non-finite simulation counters")
+    required_warmup, required_sample = graphical_window(case)
     if (not all(isfinite(value) for value in (warmup, timing["sample_seconds"], timing["fps"], frame_ms))
-            or warmup < 8 or timing["sample_seconds"] < 30 or timing["fps"] <= 0 or frame_ms <= 0):
-        raise ValueError("Invalid or insufficient warmed graphical sample (requires 8s warm-up and 30s sample)")
+            or warmup < required_warmup or timing["sample_seconds"] < required_sample
+            or timing["fps"] <= 0 or frame_ms <= 0):
+        raise ValueError(f"Invalid or insufficient warmed graphical sample (requires {required_warmup:g}s "
+                         f"warm-up and {required_sample:g}s sample)")
 
 
 def execute_case(case, hardware, directory):
@@ -268,8 +317,10 @@ def _flatten(value, prefix=""):
     return f"{prefix}={_number(value) if isinstance(value, float) else value}"
 
 
-def format_summary(results, hardware=None, checks=(), note=None, issue_39=None):
+def format_summary(results, hardware=None, checks=(), note=None, issue_39=None, plan_text=None):
     lines = ["Fluids acceptance (plain text)"]
+    if plan_text:
+        lines.append(plan_text)
     if hardware:
         lines.append(f"Renderer: {hardware.renderer}; GPU: {hardware.gpu}; driver: {hardware.driver}; "
                      f"refresh: {hardware.refresh_hz:g} Hz ({_flatten(hardware.displays)})")
@@ -359,9 +410,21 @@ def run_checks(directory):
     return checks
 
 
+def positive_seconds(value):
+    seconds = float(value)
+    if not isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("seconds must be finite and positive")
+    return seconds
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", type=int, choices=(36, 37, 38, 39), help="run only this issue's cases")
+    parser.add_argument("--full", action="store_true", help="run exhaustive matrices, stage diagnostics and reset sweeps")
+    parser.add_argument("--sample-seconds", type=positive_seconds, default=30,
+                        help="graphical sample window (default: 30s); shorter windows weaken evidence")
+    parser.add_argument("--warmup-seconds", type=positive_seconds, default=8,
+                        help="graphical warm-up (default: 8s); shorter warm-up weakens evidence")
     parser.add_argument("--results", type=Path, help="new results directory (must not already exist)")
     parser.add_argument("--with-checks", action="store_true", help="first run non-performance CPU tests and GPU smoke")
     args = parser.parse_args(argv)
@@ -381,7 +444,15 @@ def main(argv=None):
         issue_39 = {"status": "skipped", "reason": reason} if reason else {"status": "available"}
     else:
         issue_39 = {"status": "not selected"}
-    cases = build_cases(args.only, issue_39_available=issue_39["status"] == "available")
+    cases = build_cases(args.only, issue_39_available=issue_39["status"] == "available", full=args.full,
+                        warmup_seconds=args.warmup_seconds, sample_seconds=args.sample_seconds)
+    plan = plan_cases(cases)
+    plan_text = format_plan(plan, args.full)
+    if args.sample_seconds < 30 or args.warmup_seconds < 8:
+        plan_text += ("\nWARNING: Shorter windows weaken evidence; this is a quick re-check. "
+                      "A sample below 30s does not meet the issues' acceptance requirement; "
+                      "repeat with the default 8s warm-up and 30s sample for acceptance.")
+    print(plan_text, flush=True)
     results = [{"name": case.name, "issue": case.issue, "graphical": case.graphical,
                 "status": "skipped", "reason": "not run"} for case in cases]
     hardware, checks, note, active_index = None, [], None, None
@@ -398,8 +469,10 @@ def main(argv=None):
                 raise PreflightError("Non-performance correctness prerequisite failed; see check logs.")
         for index, case in enumerate(cases):
             active_index = index
+            timing = ("graphical (%gs warm-up + %gs sample)" % graphical_window(case) if case.graphical
+                      else "stage diagnostic; no FPS")
             print(f"[{index + 1}/{len(cases)}] {case.name}: "
-                  f"{'graphical (8s warm-up + 30s sample)' if case.graphical else 'stage diagnostic; no FPS'}",
+                  f"{timing}",
                   flush=True)
             results[index] = execute_case(case, hardware, directory)
             active_index = None
@@ -411,8 +484,10 @@ def main(argv=None):
         for result in results:
             if result["status"] == "skipped":
                 result["reason"] = note
-    summary = format_summary(results, hardware, checks, note, issue_39)
+    summary = format_summary(results, hardware, checks, note, issue_39, plan_text)
     manifest = {"hardware": asdict(hardware) if hardware else None, "only": args.only,
+                "profile": "full" if args.full else "default", "plan": plan,
+                "warmup_seconds": args.warmup_seconds, "sample_seconds": args.sample_seconds,
                 "checks_non_performance": checks, "cases": results, "note": note,
                 "issue_39": issue_39}
     archive = assemble_archive(directory, manifest, summary)

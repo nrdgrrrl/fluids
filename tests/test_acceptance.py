@@ -39,12 +39,12 @@ def native_fixture():
             "substeps": 4, "scalar_reads": {"counts": {"overflow": 4, "timestep": 4}, "total": 8}}
 
 
-def render_fixture():
+def render_fixture(resets=10):
     return {"warmup_seconds": 8, "timing": {"sample_seconds": 30, "fps": 2, "mean_frame_ms": 500,
                                            "frames": 60, "mean_substeps": 0},
             "simulation_start": {"simulated_seconds": 3, "discarded_seconds": 1},
             "simulation_end": {"simulated_seconds": 3.25, "discarded_seconds": 1.125},
-            "water_city_resets": [{"reset": index + 1, "particles": 5} for index in range(10)],
+            "water_city_resets": [{"reset": index + 1, "particles": 5} for index in range(resets)],
             "process_memory": {"sample_start_rss_bytes": None},
             "gpu_memory": "unmeasured"}
 
@@ -164,8 +164,24 @@ class AvailabilityTests(unittest.TestCase):
 
 
 class CaseTests(unittest.TestCase):
-    def test_all_documented_cases_and_sampling_are_present(self):
+    def test_default_is_exactly_the_ten_minimal_graphical_comparisons(self):
         cases = acceptance.build_cases()
+        self.assertEqual({case.name for case in cases}, {
+            "36-legacy-idle", "36-fixed-idle", "36-fixed-wave",
+            "38-duplicate-medium-idle", "38-cached-medium-idle",
+            "37-stock-paused", "37-device-paused", "37-device-active",
+            "39-budget-12-medium-wave", "39-budget-0-medium-wave",
+        })
+        self.assertEqual(len(cases), 10)
+        self.assertTrue(all(case.graphical for case in cases))
+        self.assertEqual({case.name for case in cases if case.capture},
+                         {"37-stock-paused", "37-device-paused", "37-device-active"})
+        for case in cases:
+            self.assertEqual(acceptance.graphical_window(case), (8, 30))
+            self.assertEqual(acceptance.reset_count(case), 0)
+
+    def test_all_documented_cases_and_sampling_are_present(self):
+        cases = acceptance.build_cases(full=True)
         self.assertEqual(len(cases), 45)
         self.assertEqual(len({case.name for case in cases}), 45)
         self.assertEqual(sum(case.graphical for case in cases), 31)
@@ -191,16 +207,47 @@ class CaseTests(unittest.TestCase):
         self.assertIn("37-device-active", names)
 
     def test_selector_filters_exactly_one_issue(self):
-        for issue, size in ((36, 15), (37, 6), (38, 12), (39, 12)):
-            cases = acceptance.build_cases(issue)
-            self.assertEqual(len(cases), size)
-            self.assertTrue(all(case.issue == issue for case in cases))
+        for full, sizes in ((False, ((36, 3), (37, 3), (38, 2), (39, 2))),
+                            (True, ((36, 15), (37, 6), (38, 12), (39, 12)))):
+            for issue, size in sizes:
+                with self.subTest(full=full, issue=issue):
+                    cases = acceptance.build_cases(issue, full=full)
+                    self.assertEqual(len(cases), size)
+                    self.assertTrue(all(case.issue == issue for case in cases))
+
+    def test_timing_overrides_reach_both_harnesses_but_leave_diagnostics_unchanged(self):
+        for full in (False, True):
+            defaults = {case.name: case for case in acceptance.build_cases(full=full)}
+            cases = acceptance.build_cases(full=full, warmup_seconds=0.5, sample_seconds=2.5)
+            for case in cases:
+                if case.graphical:
+                    self.assertEqual(acceptance.graphical_window(case), (0.5, 2.5))
+                    command = acceptance.case_command(case, HARDWARE, Path("/results"))
+                    self.assertIn("0.5", command)
+                    self.assertIn("2.5", command)
+                else:
+                    self.assertEqual(case, defaults[case.name])
+
+    def test_plan_counts_actual_windows_diagnostics_and_resets(self):
+        default = acceptance.plan_cases(acceptance.build_cases())
+        self.assertEqual(default, {"cases": 10, "graphical": 10, "diagnostics": 0, "resets": 0,
+                                  "window_seconds": 380, "estimated_min_seconds": 580,
+                                  "estimated_max_seconds": 980})
+        full = acceptance.plan_cases(acceptance.build_cases(full=True))
+        self.assertEqual((full["cases"], full["graphical"], full["diagnostics"], full["resets"]),
+                         (45, 31, 14, 60))
+        self.assertEqual(full["window_seconds"], 31 * 38)
+        shorter = acceptance.plan_cases(acceptance.build_cases(39, sample_seconds=5, warmup_seconds=1))
+        self.assertEqual(shorter["cases"], 2)
+        self.assertEqual(shorter["window_seconds"], 12)
+        self.assertEqual(shorter["estimated_min_seconds"], 52)
+        self.assertEqual(acceptance.plan_cases([])["estimated_max_seconds"], 0)
 
     def test_issue_39_budget_pairs_cover_native_scenarios_and_stage_diagnostics(self):
         pairs = {}
         native_scenarios = set()
         stage_scenarios = set()
-        for case in acceptance.build_cases(39):
+        for case in acceptance.build_cases(39, full=True):
             self.assertEqual(case.module, "fluids.benchmark")
             self.assertFalse(case.capture)
             flags = list(case.flags)
@@ -230,12 +277,13 @@ class CaseTests(unittest.TestCase):
         self.assertTrue(all(sorted(budgets) == ["0", "12"] for budgets in pairs.values()))
 
     def test_unavailable_issue_39_does_not_change_other_cases(self):
-        cases = acceptance.build_cases(issue_39_available=False)
-        self.assertEqual(cases, [case for case in acceptance.build_cases() if case.issue != 39])
-        self.assertEqual(acceptance.build_cases(39, issue_39_available=False), [])
+        for full in (False, True):
+            cases = acceptance.build_cases(issue_39_available=False, full=full)
+            self.assertEqual(cases, [case for case in acceptance.build_cases(full=full) if case.issue != 39])
+            self.assertEqual(acceptance.build_cases(39, issue_39_available=False, full=full), [])
 
     def test_commands_use_current_python_detected_labels_and_unique_paths(self):
-        for case in acceptance.build_cases():
+        for case in acceptance.build_cases(full=True):
             command = acceptance.case_command(case, HARDWARE, Path("/results"))
             self.assertEqual(command[:3], [acceptance.sys.executable, "-m", case.module])
             self.assertIn(HARDWARE.gpu, command)
@@ -262,19 +310,38 @@ class ExecutionTests(unittest.TestCase):
             report = dict(native_fixture(), **{key: value})
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 acceptance.validate_report(case, report)
-        render = acceptance.build_cases(37)[0]
+        render = acceptance.build_cases(37, full=True)[0]
         acceptance.validate_report(render, render_fixture())
         report = render_fixture()
         report["water_city_resets"].pop()
         with self.assertRaisesRegex(ValueError, "reset"):
             acceptance.validate_report(render, report)
 
+    def test_quick_samples_validate_requested_window_and_default_has_no_reset_requirement(self):
+        for full in (False, True):
+            for issue in (36, 37):
+                with self.subTest(full=full, issue=issue):
+                    case = acceptance.build_cases(issue, full=full, warmup_seconds=1, sample_seconds=3)[0]
+                    report = render_fixture(10 if full else 0) if case.capture else native_fixture()
+                    timing = report["timing"] if case.capture else report
+                    report["warmup_seconds"] = 1
+                    timing["sample_seconds"] = 3
+                    acceptance.validate_report(case, report)
+                    timing["sample_seconds"] = 2.9
+                    with self.assertRaisesRegex(ValueError, "3s sample"):
+                        acceptance.validate_report(case, report)
+                    timing["sample_seconds"] = 3
+                    report["warmup_seconds"] = 0.9
+                    with self.assertRaisesRegex(ValueError, "1s warm-up"):
+                        acceptance.validate_report(case, report)
+
     def test_fresh_process_for_each_case_and_capture_is_required(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
 
             def fake_harness(command, stdout, stderr, **kwargs):
-                report = render_fixture() if "--capture" in command else native_fixture()
+                report = (render_fixture(int(command[command.index("--resets") + 1]))
+                          if "--capture" in command else native_fixture())
                 stdout.write("[Taichi] startup\n" + json.dumps(report))
                 if "--capture" in command:
                     Path(command[command.index("--capture") + 1]).write_bytes(b"mock capture, not rendered pixels")
@@ -290,7 +357,7 @@ class ExecutionTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 2)
 
             def no_capture(command, stdout, stderr, **kwargs):
-                stdout.write(json.dumps(render_fixture()))
+                stdout.write(json.dumps(render_fixture(0)))
                 return SimpleNamespace(returncode=0)
 
             with patch.object(acceptance.subprocess, "run", side_effect=no_capture):
@@ -372,7 +439,7 @@ class SummaryAndArchiveTests(unittest.TestCase):
             self.assertEqual(code, 1)
             run.assert_not_called()
             manifest = json.loads((directory / "manifest.json").read_text())
-            self.assertEqual(len(manifest["cases"]), 6)
+            self.assertEqual(len(manifest["cases"]), 3)
             self.assertTrue(all(row["status"] == "skipped" for row in manifest["cases"]))
             self.assertNotIn("FPS=", stdout.getvalue())
             self.assertIn("unexecuted/unmeasured", stdout.getvalue())
@@ -389,6 +456,72 @@ class SummaryAndArchiveTests(unittest.TestCase):
             self.assertEqual(acceptance.main(["--results", str(directory)]), 1)
             self.assertEqual(run.call_count, 2)
             self.assertTrue(directory.with_suffix(".zip").exists())
+
+    def test_plan_is_printed_before_preflight_and_derived_from_actual_case_list(self):
+        cases = acceptance.build_cases(37, warmup_seconds=1, sample_seconds=2)[:2]
+        output = io.StringIO()
+
+        def refuse(directory):
+            self.assertIn("2 cases (2 graphical, 0 stage diagnostics), 0 resets", output.getvalue())
+            self.assertIn("Warm-up/sampling alone: 0.1 min", output.getvalue())
+            self.assertIn("Estimated duration: 0.8–2.1 min", output.getvalue())
+            self.assertIn("derived from the selected case list", output.getvalue())
+            raise acceptance.PreflightError("headless")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance, "build_cases", return_value=cases), \
+                patch.object(acceptance, "preflight", side_effect=refuse), contextlib.redirect_stdout(output):
+            directory = Path(tmp) / "run"
+            self.assertEqual(acceptance.main(["--results", str(directory)]), 1)
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["plan"], acceptance.plan_cases(cases))
+            self.assertIn("Planned default profile: 2 cases", (directory / "summary.txt").read_text())
+
+    def test_main_default_and_full_pass_timing_options_and_archive_evidence_warning(self):
+        def measured(case, hardware, directory):
+            report = render_fixture(acceptance.reset_count(case)) if case.capture else native_fixture()
+            if case.graphical:
+                warmup, sample = acceptance.graphical_window(case)
+                report["warmup_seconds"] = warmup
+                (report["timing"] if case.capture else report)["sample_seconds"] = sample
+            else:
+                report = {"kind": "synchronized_evolving_stages"}
+            acceptance.validate_report(case, report)
+            return {"name": case.name, "issue": case.issue, "graphical": case.graphical,
+                    "status": "measured" if case.graphical else "diagnostic", "report": report}
+
+        for full in (False, True):
+            with self.subTest(full=full), tempfile.TemporaryDirectory() as tmp, patch.object(
+                    acceptance, "preflight", return_value=HARDWARE), patch.object(
+                    acceptance, "execute_case", side_effect=measured) as run, contextlib.redirect_stdout(
+                    io.StringIO()) as stdout:
+                directory = Path(tmp) / "run"
+                args = ["--results", str(directory), "--warmup-seconds", "1", "--sample-seconds", "3"]
+                if full:
+                    args.append("--full")
+                self.assertEqual(acceptance.main(args), 0)
+                cases = acceptance.build_cases(full=full, warmup_seconds=1, sample_seconds=3)
+                self.assertEqual([call.args[0] for call in run.call_args_list], cases)
+                self.assertIn("graphical (1s warm-up + 3s sample)", stdout.getvalue())
+                self.assertIn("Shorter windows weaken evidence", stdout.getvalue())
+                self.assertIn("does not meet the issues' acceptance requirement", stdout.getvalue())
+                summary = (directory / "summary.txt").read_text()
+                self.assertIn("quick re-check", summary)
+                manifest = json.loads((directory / "manifest.json").read_text())
+                self.assertEqual(manifest["profile"], "full" if full else "default")
+                self.assertEqual((manifest["warmup_seconds"], manifest["sample_seconds"]), (1, 3))
+                self.assertEqual(manifest["plan"], acceptance.plan_cases(cases))
+
+    def test_invalid_timing_options_stop_before_creating_results_or_probing(self):
+        for flag in ("--sample-seconds", "--warmup-seconds"):
+            for value in ("0", "-1", "nan", "inf", "-inf", "invalid"):
+                with self.subTest(flag=flag, value=value), tempfile.TemporaryDirectory() as tmp, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    directory = Path(tmp) / "run"
+                    with self.assertRaises(SystemExit) as exit_status:
+                        acceptance.main(["--results", str(directory), f"{flag}={value}"])
+                    self.assertEqual(exit_status.exception.code, 2)
+                    self.assertFalse(directory.exists())
+                    self.probe.assert_not_called()
 
     def test_optional_checks_are_non_performance_and_failure_blocks_cases(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance, "preflight", return_value=HARDWARE), patch.object(
@@ -408,8 +541,8 @@ class SummaryAndArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance, "preflight", return_value=HARDWARE), patch.object(
                 acceptance, "execute_case", side_effect=measured) as run, contextlib.redirect_stdout(io.StringIO()) as stdout:
             directory = Path(tmp) / "run"
-            self.assertEqual(acceptance.main(["--results", str(directory), "--only", "39"]), 0)
-            self.assertEqual([call.args[0] for call in run.call_args_list], acceptance.build_cases(39))
+            self.assertEqual(acceptance.main(["--results", str(directory), "--only", "39", "--full"]), 0)
+            self.assertEqual([call.args[0] for call in run.call_args_list], acceptance.build_cases(39, full=True))
             summary = stdout.getvalue()
             self.assertNotIn("Issue #39: skipped", summary)
             graphical, stages = summary.split("SYNCHRONIZED Vulkan stage diagnostics")
@@ -430,7 +563,7 @@ class SummaryAndArchiveTests(unittest.TestCase):
                     "status": "measured" if case.graphical else "diagnostic",
                     "report": render_fixture() if case.capture else native_fixture() if case.graphical else {}}
 
-        for only, expected, size in (([], 0, 33), (["--only", "39"], 1, 0)):
+        for only, expected, size in (([], 0, 8), (["--full"], 0, 33), (["--only", "39"], 1, 0)):
             with self.subTest(only=only), tempfile.TemporaryDirectory() as tmp, patch.object(
                     acceptance, "preflight", return_value=HARDWARE), patch.object(acceptance, "execute_case",
                     side_effect=measured) as run, contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -451,7 +584,7 @@ class SummaryAndArchiveTests(unittest.TestCase):
             self.assertEqual(acceptance.main(["--results", str(directory), "--only", "39"]), 1)
             run.assert_not_called()
             rows = json.loads((directory / "manifest.json").read_text())["cases"]
-            self.assertEqual(len(rows), 12)
+            self.assertEqual(len(rows), 2)
             self.assertTrue(all(row["status"] == "skipped" and "report" not in row for row in rows))
             self.assertNotIn("FPS=", stdout.getvalue())
             self.assertIn("unexecuted/unmeasured", stdout.getvalue())
