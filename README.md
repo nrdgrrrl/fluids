@@ -138,6 +138,90 @@ The existing optional `FLUIDS_TEST_NATIVE=1` test checks the legacy resizable
 GLFW/wgpu clear-window backend. It does not verify the application's GGUI scene.
 Software Vulkan/Xvfb results do not establish physical GPU performance.
 
+### Device vertex staging (issue #37)
+
+The renderer owns reusable 12-float `ti.Vector.ndarray` VBOs. Static positions,
+normals and colors are packed only on a changed world; the outline is packed
+only on changed bounds. Particle packing visits only `particle_count`, and the
+core receives both that prefix's shape and element count. For medium water,
+the submitted particle data is **881,280 bytes** (18,360 × 48), rather than the
+reserved **6,291,456 bytes** (131,072 × 48). These are calculated buffer sizes.
+The device VBO retains solver capacity for allocation-free water/city resets;
+a larger source capacity grows it after synchronizing outstanding uses.
+
+Taichi 1.7.4's [SceneV2 helper](https://github.com/taichi-dev/taichi/blob/v1.7.4/python/taichi/ui/staging_buffer.py)
+allocates a NumPy VBO on each draw. Passing an ndarray to the public scene
+methods would still invoke that helper. Fluids instead passes `FieldInfo`
+directly to the pinned core scene, with `TaichiNDarray` and the array's actual
+`DeviceAllocation`. A local adapter supports both `get_device_allocation()`
+and the installed core's `device_allocation()`, and fails explicitly on an
+unsupported accessor or Taichi version; it changes no Taichi globals.
+
+With Vulkan, Taichi's [core copy path](https://github.com/taichi-dev/taichi/blob/v1.7.4/taichi/ui/ggui/renderable.cpp)
+enqueues a same-device buffer copy. It still copies static VBOs to its own
+render buffers each frame. The core also reserves host-writable staging buffers;
+the same-device path does not map or fill them with particle data. Thus the
+claim is absence of particle-sized **host uploads during steady frames**, not
+absence of every host-visible allocation in GGUI or zero-copy drawing.
+
+```sh
+python -m unittest discover -s tests -p 'test_rendering.py' -v
+FLUIDS_TEST_PARTICLE_ARCH=vulkan python -m unittest discover -s tests -p 'test_rendering.py' -v
+```
+
+The CPU contracts use real packing kernels, `FieldInfo` and allocation objects,
+with a mocked native scene. They verify active transfer bounds, untouched tails,
+RGB/RGBA and uniform colors, normals, lighting, camera submission, static caching,
+ten water/city resets without new fields or VBOs, source replacement and growth,
+and the pinned wheel/core compatibility adapter. Steady-frame checks forbid the
+stock staging helpers, downloads and new device VBOs. The Vulkan command runs
+these same contracts with CPU fallback disabled; it still does not render pixels.
+
+For a native comparison, run each case in a fresh process on the Intel desktop:
+
+```sh
+for scenario in paused active wave; do
+  for staging in stock device; do
+    python -m fluids.render_benchmark --staging "$staging" --scenario "$scenario" \
+      --quality medium --warmup 8 --seconds 30 --resets 10 \
+      --gpu 'Intel UHD Graphics CML GT2 (8086:9b41)' \
+      --driver 'i915 / Mesa 25.2.8' --refresh-hz 59.96 \
+      --capture "${staging}-${scenario}.png" --output "${staging}-${scenario}.json"
+  done
+done
+```
+
+Use the actual installed driver and refresh rate. Repeat in reverse order to
+check drift, and repeat with `--quality low` if needed. Keep the same desktop,
+1440 × 900, vsync, camera and settings; leave controls untouched while sampling.
+`stock` reproduces the original public SceneV2 path without allocating device
+VBOs. `paused` stops physics, `active` runs without a wave, and `wave` launches
+one default wave after physics compilation. The unchanged application loop is
+timed with instance wrappers. First-frame compilation and image capture, plus
+eight seconds of warm-up, are excluded. No additional synchronization is added
+to sampled frames. Timing is wall-clock FPS, mean frame, render submission and
+physics advance time, not isolated GPU timestamps. Reports include simulated
+and discarded time, process RSS at sample boundaries, staging metadata, and ten
+subsequent water/city reset timings and RSS samples. Device reports assert the
+actual draw metadata and active transfer bounds. Core buffers can grow to the
+largest scene seen; watch for continued memory growth after that point.
+
+Process RSS is not GPU memory, and VBO sizes are not measured total memory.
+Record driver/process GPU memory separately on the desktop, before/after warm-up
+and across resets, together with evidence of Intel render-engine activity.
+Compare the initial paused stock/device captures for water coverage/color,
+floor/building normals and lighting, outlines, and camera framing. The captures
+read back pixels only in the excluded first frame. Also complete the manual
+interaction/reset pass below; static screenshots do not establish interaction
+acceptance. Report paused rendering gains separately from active physics costs.
+
+This implementation environment has Python 3.11.2 and the pinned Taichi wheel,
+but no `/dev/dri`, Vulkan ICD or `DISPLAY`. The benchmark fails at Vulkan
+initialization without fallback. Intel Vulkan compatibility and the manual
+rendered comparison are **unexecuted**; target-GPU paused/active/wave FPS,
+submission time, memory and native ten-reset measurements are **unmeasured**.
+CPU contracts support the code path but cannot complete hardware acceptance.
+
 ## Manual pass and performance record
 
 Run `fluids` on the target desktop after CPU tests and the GPU smoke check.

@@ -212,10 +212,11 @@ class ParticleFieldTests(unittest.TestCase):
             renderer.render(scene, particle_positions=self.state.positions,
                             particle_colors=self.state.colors, particle_count=self.state.active_count,
                             particle_radius=self.state.collision_radius)
-        scene.particles.assert_called_once_with(
-            self.state.positions, radius=self.state.collision_radius, color=WATER_COLOR,
-            per_vertex_color=self.state.colors, index_count=self.state.active_count,
+        scene.scene.particles.assert_called_once_with(
+            renderer._particle_info, True, False, WATER_COLOR,
+            self.state.collision_radius, self.state.active_count, 0,
         )
+        self.assertEqual(renderer._particle_info.num_elements, 12 * self.state.active_count)
 
 
 if __name__ == "__main__":
