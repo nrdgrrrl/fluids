@@ -22,6 +22,9 @@ from numbers import Integral
 
 import numpy as np
 import taichi as ti
+from taichi._lib import core as ti_core
+from taichi.lang._ndarray import Ndarray
+from taichi.lang.matrix import MatrixField
 
 from .world import World
 
@@ -34,6 +37,70 @@ FLOOR_COLOR = (0.12, 0.24, 0.31)
 OUTLINE_COLOR = (0.72, 0.82, 0.90)
 WATER_COLOR = (0.04, 0.48, 0.85)
 AMBIENT_LIGHT = (0.45, 0.45, 0.50)
+VBO_STRIDE = 12  # GGUI 1.7.4: position(3), normal(3), uv(2), RGBA(4)
+
+
+def _device_allocation(array):
+    """Handle the pinned wheel's Python/core ndarray naming mismatch locally."""
+    for name in ("get_device_allocation", "device_allocation"):
+        getter = getattr(array, name, None)
+        if callable(getter):
+            allocation = getter()
+            if not isinstance(allocation, ti_core.DeviceAllocation):
+                raise RuntimeError("Taichi ndarray accessor did not return a DeviceAllocation")
+            return allocation
+    raise RuntimeError("Taichi 1.7.4 core has no supported ndarray allocation accessor")
+
+
+def _device_field_info(vbo, count):
+    """Describe only a device VBO's populated prefix to the GGUI core.
+
+    This replaces ui.utils.get_field_info's broken ndarray branch, without
+    changing Taichi globals. The core copies num_elements * sizeof(float),
+    independently of the draw count, so both metadata bounds matter.
+    """
+    if not isinstance(vbo, Ndarray) or vbo.dtype != ti.f32 or (
+        len(vbo.shape) != 1 or vbo.element_shape != (VBO_STRIDE,) or vbo.layout != ti.Layout.AOS
+    ):
+        raise ValueError("GGUI VBO must be a 1D device ndarray of 12-component float32 vectors")
+    if isinstance(count, bool) or not isinstance(count, Integral) or not 0 < count <= vbo.shape[0]:
+        raise ValueError("GGUI VBO prefix must be positive and within capacity")
+    info = ti_core.FieldInfo()
+    info.valid = True
+    info.field_source = ti_core.FieldSource.TaichiNDarray
+    info.dev_alloc = _device_allocation(vbo.arr)
+    info.dtype = vbo.dtype
+    info.num_elements = int(count) * VBO_STRIDE
+    info.shape = [int(count), VBO_STRIDE]
+    return info
+
+
+def _validate_vector_field(field, name, components):
+    if not isinstance(field, MatrixField) or (
+        len(field.shape) != 1 or field.m != 1
+        or field.n not in components or field.dtype != ti.f32
+    ):
+        raise ValueError(f"{name} must be a 1D float32 Taichi vector field with {components} components")
+
+
+@ti.kernel
+def _pack_vbo(
+    vbo: ti.types.ndarray(element_dim=1),
+    positions: ti.template(), normals: ti.template(), colors: ti.template(), count: ti.i32,
+):
+    # Runtime count bounds work and writes, even when the solver reserves much
+    # more space. Initialize every lane so optional attributes cannot go stale.
+    for i in range(count):
+        vbo[i] = ti.Vector.zero(ti.f32, VBO_STRIDE)
+        vbo[i][0:3] = positions[i]
+        vbo[i][11] = 1.0
+        if ti.static(normals != 0):
+            vbo[i][3:6] = normals[i]
+        if ti.static(colors != 0):
+            if ti.static(colors.n == 3):
+                vbo[i][8:11] = colors[i]
+            else:
+                vbo[i][8:12] = colors[i]
 
 
 def _container_outline(world: World) -> np.ndarray:
@@ -91,19 +158,34 @@ def _static_mesh(world: World) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]
 
 
 class Renderer:
-    """Fixed GPU fields shared by every world reset and frame.
+    """Reusable fields and device VBOs shared by world resets and frames.
 
     Construct once after ``initialize_gpu()``. ``update_world`` performs CPU
-    mesh generation and uploads only for changed geometry. ``render`` reads
-    existing GPU fields; the scene's own staging stays on the GPU with Vulkan.
+    mesh generation, uploads and VBO packing only for changed geometry.
+    ``render`` packs the active water prefix into a reusable device ndarray.
+    It bypasses SceneV2's NumPy staging via the pinned 1.7.4 core interface;
+    Vulkan copies the populated prefix between buffers on the same device.
+    GGUI still owns internal render buffers (including unused host-writable
+    staging allocations); this path does not map them to upload vertex data.
     The camera belongs to the caller so orbit controls remain independent.
     """
 
     def __init__(self, world: World) -> None:
+        if ti.__version__ != (1, 7, 4):
+            raise RuntimeError("Device GGUI staging requires the pinned Taichi 1.7.4 core API")
         self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=STATIC_VERTEX_CAPACITY)
         self.colors = ti.Vector.field(3, dtype=ti.f32, shape=STATIC_VERTEX_CAPACITY)
         self.normals = ti.Vector.field(3, dtype=ti.f32, shape=STATIC_VERTEX_CAPACITY)
         self.outline_vertices = ti.Vector.field(3, dtype=ti.f32, shape=OUTLINE_VERTEX_COUNT)
+        self._mesh_vbo = ti.Vector.ndarray(VBO_STRIDE, ti.f32, shape=STATIC_VERTEX_CAPACITY)
+        self._outline_vbo = ti.Vector.ndarray(VBO_STRIDE, ti.f32, shape=OUTLINE_VERTEX_COUNT)
+        self._particle_vbo = None
+        self._particle_info = None
+        self._no_indices = ti_core.FieldInfo()
+        self._no_indices.valid = False
+        self._mesh_packs = self._outline_packs = self._particle_packs = 0
+        self._particle_allocations = 0
+        self._last_particle_count = 0
         self.world: World | None = None
         self.vertex_count = 0
         self.update_world(world)
@@ -121,11 +203,17 @@ class Renderer:
         self.vertices.from_numpy(vertices)
         self.colors.from_numpy(colors)
         self.normals.from_numpy(normals)
+        _pack_vbo(self._mesh_vbo, self.vertices, self.normals, self.colors, vertex_count)
+        self._mesh_info = _device_field_info(self._mesh_vbo, vertex_count)
+        self._mesh_packs += 1
         if self.world is None or (
             world.domain_min != self.world.domain_min
             or world.domain_max != self.world.domain_max
         ):
             self.outline_vertices.from_numpy(_container_outline(world))
+            _pack_vbo(self._outline_vbo, self.outline_vertices, 0, 0, OUTLINE_VERTEX_COUNT)
+            self._outline_info = _device_field_info(self._outline_vbo, OUTLINE_VERTEX_COUNT)
+            self._outline_packs += 1
         self.world = world
         self.vertex_count = vertex_count
         return True
@@ -138,11 +226,13 @@ class Renderer:
 
         ``scene`` is obtained with ``ti.ui.Window.get_scene()``; set its camera
         before calling this method and present it on the canvas afterward.
-        Particle positions and optional colors are 1D three-component Taichi
-        fields. ``particle_count`` selects the active prefix of a fixed solver
-        buffer; zero draws no particles and None draws the whole field.
+        Particle positions are 1D float32 three-component Taichi fields; colors
+        may have three or four components. ``particle_count`` selects the active
+        prefix of a fixed solver buffer; zero draws no particles and None draws
+        the whole field.
         """
         if particle_positions is not None:
+            _validate_vector_field(particle_positions, "particle_positions", (3,))
             if not isfinite(particle_radius) or particle_radius <= 0:
                 raise ValueError("particle_radius must be positive and finite")
             if particle_count is not None and (
@@ -151,6 +241,11 @@ class Renderer:
                 or not 0 <= particle_count <= particle_positions.shape[0]
             ):
                 raise ValueError("particle_count must be within the position field capacity")
+            particle_count = particle_positions.shape[0] if particle_count is None else int(particle_count)
+            if particle_colors is not None:
+                _validate_vector_field(particle_colors, "particle_colors", (3, 4))
+                if particle_colors.shape[0] < particle_count:
+                    raise ValueError("particle_colors must cover the active position prefix")
         elif particle_count is not None or particle_colors is not None:
             raise ValueError("particle_count and particle_colors require particle_positions")
 
@@ -166,13 +261,52 @@ class Renderer:
             pos=(center_x + width, upper[1] + height * 0.5, upper[2] + depth),
             color=(0.35, 0.45, 0.60),
         )
-        scene.mesh(
-            self.vertices, normals=self.normals, per_vertex_color=self.colors,
-            two_sided=True, vertex_count=self.vertex_count,
-        )
-        scene.lines(self.outline_vertices, width=2.0, color=OUTLINE_COLOR)
+        self._draw_static(scene)
+        self._last_particle_count = 0
         if particle_positions is not None and particle_count != 0:
-            scene.particles(
-                particle_positions, radius=particle_radius, color=WATER_COLOR,
-                per_vertex_color=particle_colors, index_count=particle_count,
-            )
+            self._draw_particles(scene, particle_positions, particle_colors, particle_radius, particle_count)
+
+    def _draw_static(self, scene):
+        # Match SceneV2's positional core arguments, without its host VBO helper.
+        scene.scene.mesh(
+            self._mesh_info, True, self._no_indices, (0.5, 0.5, 0.5), True,
+            self.vertex_count, 0, self.vertex_count, 0, False,
+        )
+        scene.scene.lines(
+            self._outline_info, self._no_indices, False, OUTLINE_COLOR, 2.0,
+            OUTLINE_VERTEX_COUNT, 0, OUTLINE_VERTEX_COUNT, 0,
+        )
+
+    def _draw_particles(self, scene, positions, colors, radius, count):
+        if self._particle_vbo is None or self._particle_vbo.shape[0] < positions.shape[0]:
+            # Ordinary water/city resets reuse solver capacity and never enter
+            # this branch. Drain pending uses before replacing an allocation.
+            if self._particle_vbo is not None:
+                ti.sync()
+            vbo = ti.Vector.ndarray(VBO_STRIDE, ti.f32, shape=positions.shape[0])
+            info = _device_field_info(vbo, count)
+            self._particle_vbo, self._particle_info = vbo, info
+            self._particle_allocations += 1
+        elif self._particle_info.shape[0] != count:
+            self._particle_info = _device_field_info(self._particle_vbo, count)
+        _pack_vbo(self._particle_vbo, positions, 0, colors if colors is not None else 0, count)
+        self._particle_packs += 1
+        self._last_particle_count = count
+        scene.scene.particles(
+            self._particle_info, colors is not None, False, WATER_COLOR, radius, count, 0,
+        )
+
+    def staging_info(self):
+        """Metadata-only diagnostics; never download or map vertex contents."""
+        capacity = 0 if self._particle_vbo is None else self._particle_vbo.shape[0]
+        return {
+            "source": str(self._mesh_info.field_source), "backend": str(ti.cfg.arch),
+            "particle_source": None if self._particle_info is None else str(self._particle_info.field_source),
+            "particle_capacity": capacity,
+            "particle_allocations": self._particle_allocations,
+            "particle_packs": self._particle_packs,
+            "particles_packed_last_frame": self._last_particle_count,
+            "particle_bytes_submitted": self._last_particle_count * VBO_STRIDE * 4,
+            "device_vbo_bytes_reserved": (STATIC_VERTEX_CAPACITY + OUTLINE_VERTEX_COUNT + capacity) * VBO_STRIDE * 4,
+            "mesh_packs": self._mesh_packs, "outline_packs": self._outline_packs,
+        }
