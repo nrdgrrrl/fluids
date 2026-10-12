@@ -209,6 +209,20 @@ class PanelTests(unittest.TestCase):
         self.assertIsNone(self.controls.last_error)
         self.assertFalse(self.panel.pending_reset)
 
+    def test_rates_show_actual_progress_and_discard_then_clear_on_reset(self):
+        self.simulation.simulated_time += 0.01
+        self.simulation.discarded_time += 0.03
+        gui = Gui()
+        self.panel.draw(gui, 0.04)
+        self.assertIn("Sim rate: 0.250 s/wall s", gui.lines)
+        self.assertIn("Discard rate: 0.750 s/wall s", gui.lines)
+        self.panel.draw(Gui(), 1.1)  # No progress while paused.
+        self.assertEqual(self.panel.simulation_rate, 0)
+        self.simulation.simulated_time = self.simulation.discarded_time = 0
+        self.panel.draw(Gui(), 0.04)
+        self.assertEqual(self.panel.simulation_rate, 0)
+        self.assertEqual(self.panel.discard_rate, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+import taichi as ti
 
 from fluids import app, benchmark
 from fluids.config import Settings
@@ -79,7 +80,7 @@ class BenchmarkTests(unittest.TestCase):
               patch.object(app, "Application", FakeApplication),
               patch.object(benchmark, "perf_counter", side_effect=times),
               patch.object(benchmark.ti, "sync", side_effect=AssertionError("extra sync"))):
-            result = benchmark.measure_native(sim, warmup_seconds=8, sample_seconds=1)
+            result = benchmark.measure_native(sim, warmup_seconds=8, sample_seconds=1, input_probes=False)
         self.assertTrue(result["sample_complete"])
         self.assertEqual(result["frame"]["samples"], 2)
         self.assertEqual(result["fps"], 2)
@@ -88,6 +89,8 @@ class BenchmarkTests(unittest.TestCase):
         self.assertAlmostEqual(result["simulated_seconds"], 0.02)
         self.assertAlmostEqual(result["discarded_seconds"], 0.04)
         self.assertEqual(result["substeps"], 4)
+        self.assertEqual(result["steps_per_frame"]["mean"], 2)
+        self.assertEqual(result["input_latency"]["dispatch"], "unmeasured")
         self.assertEqual(result["scalar_reads"]["counts"], {"overflow": 2, "timestep": 2})
         self.assertEqual(result["scalar_reads"]["total"], 4)
         window.destroy.assert_called_once()
@@ -97,6 +100,61 @@ class BenchmarkTests(unittest.TestCase):
               contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
             benchmark.main(["--mode", "native", "--backend", "cpu"])
         initialize.assert_not_called()
+
+    def test_scheduled_input_probes_use_dispatch_and_show_and_exclude_warmup(self):
+        now = [0.0]
+        sim = SimpleNamespace(applied_settings=Settings(), paused=False, last_error=None,
+                              simulated_time=0.0, discarded_time=0.0, accumulated_time=0.0,
+                              physics_work_budget=0.012, last_budget_exhausted=True,
+                              grid=SimpleNamespace(overflow_count=FakeScalar()),
+                              dynamics=SimpleNamespace(_step_limit=FakeScalar()))
+
+        def advance(*args):
+            now[0] += 0.04
+            sim.simulated_time += 0.01
+            sim.discarded_time += 0.24
+            return 1
+
+        sim.advance = advance
+
+        class FakeApplication:
+            def __init__(self, window, simulation):
+                self.window = window
+                self.controls = SimpleNamespace(settings=sim.applied_settings,
+                                                handle_key=Mock())
+
+            def warm_up(self):
+                now[0] += 100  # Compilation is never a latency sample.
+
+            def run(self):
+                self.warm_up()
+                while self.window.running:
+                    app.monotonic()
+                    for event in self.window.get_events(ti.ui.PRESS):
+                        self.controls.handle_key(event.key, False)
+                        self.controls.handle_key(event.key, True)
+                    sim.advance(0.25)
+                    self.window.show()
+                    app.monotonic()
+
+        window = Mock(running=True)
+        window.get_events.return_value = []
+        window.show.side_effect = lambda: now.__setitem__(0, now[0] + 0.21)
+        with (patch.object(app, "create_window", return_value=window),
+              patch.object(app, "Application", FakeApplication),
+              patch.object(benchmark, "perf_counter", side_effect=lambda: now[0]),
+              patch.object(benchmark.ti, "sync", side_effect=AssertionError("extra sync"))):
+            result = benchmark.measure_native(sim, warmup_seconds=0, sample_seconds=1)
+        latency = result["input_latency"]
+        self.assertGreater(latency["dispatch"]["samples"], 0)
+        self.assertLessEqual(latency["dispatch"]["max_ms"], 250)
+        self.assertAlmostEqual(latency["presentation"]["mean_ms"] - latency["dispatch"]["mean_ms"], 250)
+        self.assertEqual(latency["physical_hid_to_photon"], "unmeasured")
+        self.assertEqual(result["budget_exhausted_frames"], result["frame"]["samples"])
+        self.assertEqual(result["budget_overrun_frames"], result["frame"]["samples"])
+        self.assertAlmostEqual(result["budget_overrun_wall"]["mean_ms"], 28)
+        self.assertAlmostEqual(result["simulated_seconds_per_wall_second"], 0.04)
+        self.assertAlmostEqual(result["discarded_seconds_per_wall_second"], 0.96)
 
 
 if __name__ == "__main__":
