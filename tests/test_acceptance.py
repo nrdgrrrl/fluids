@@ -128,12 +128,47 @@ class PreflightTests(unittest.TestCase):
             run.assert_not_called()
 
 
+class AvailabilityTests(unittest.TestCase):
+    def test_successful_help_detects_exact_budget_flag_and_archives_evidence(self):
+        for help_text, available in (("usage: benchmark [--physics-budget-ms MS]\n", True),
+                                     ("usage: benchmark [--steps STEPS]\n", False),
+                                     ("usage: benchmark [--physics-budget-ms-extra MS]\n", False)):
+            with self.subTest(help_text=help_text), tempfile.TemporaryDirectory() as tmp, patch.object(
+                    acceptance.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=help_text, stderr="mock startup")) as run:
+                reason = acceptance.probe_issue_39(Path(tmp))
+                self.assertEqual(reason is None, available)
+                if not available:
+                    self.assertIn("does not advertise --physics-budget-ms", reason)
+                run.assert_called_once_with([acceptance.sys.executable, "-m", "fluids.benchmark", "--help"],
+                                            capture_output=True, text=True, timeout=30)
+                self.assertEqual((Path(tmp) / "benchmark-help.stdout.txt").read_text(), help_text)
+                self.assertEqual((Path(tmp) / "benchmark-help.stderr.txt").read_text(), "mock startup")
+
+    def test_failed_help_is_not_treated_as_an_absent_or_supported_flag(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance.subprocess, "run", return_value=
+                SimpleNamespace(returncode=1, stdout="--physics-budget-ms", stderr="missing dependency")):
+            reason = acceptance.probe_issue_39(Path(tmp))
+            self.assertIn("exited 1", reason)
+            self.assertNotIn("does not advertise", reason)
+            self.assertEqual((Path(tmp) / "benchmark-help.stderr.txt").read_text(), "missing dependency")
+
+    def test_missing_process_and_timeout_have_truthful_skip_reasons(self):
+        for error in (FileNotFoundError("mock missing interpreter"), subprocess.TimeoutExpired("help", 30)):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp, patch.object(
+                    acceptance.subprocess, "run", side_effect=error):
+                reason = acceptance.probe_issue_39(Path(tmp))
+                self.assertIn("Could not probe", reason)
+                self.assertIn(str(error), reason)
+                self.assertIn(str(error), (Path(tmp) / "benchmark-help.stderr.txt").read_text())
+
+
 class CaseTests(unittest.TestCase):
     def test_all_documented_cases_and_sampling_are_present(self):
         cases = acceptance.build_cases()
-        self.assertEqual(len(cases), 33)
-        self.assertEqual(len({case.name for case in cases}), 33)
-        self.assertEqual(sum(case.graphical for case in cases), 23)
+        self.assertEqual(len(cases), 45)
+        self.assertEqual(len({case.name for case in cases}), 45)
+        self.assertEqual(sum(case.graphical for case in cases), 31)
         self.assertEqual(sum(case.capture for case in cases), 6)
         for case in cases:
             flags = case.flags
@@ -156,10 +191,48 @@ class CaseTests(unittest.TestCase):
         self.assertIn("37-device-active", names)
 
     def test_selector_filters_exactly_one_issue(self):
-        for issue, size in ((36, 15), (37, 6), (38, 12), (39, 0)):
+        for issue, size in ((36, 15), (37, 6), (38, 12), (39, 12)):
             cases = acceptance.build_cases(issue)
             self.assertEqual(len(cases), size)
             self.assertTrue(all(case.issue == issue for case in cases))
+
+    def test_issue_39_budget_pairs_cover_native_scenarios_and_stage_diagnostics(self):
+        pairs = {}
+        native_scenarios = set()
+        stage_scenarios = set()
+        for case in acceptance.build_cases(39):
+            self.assertEqual(case.module, "fluids.benchmark")
+            self.assertFalse(case.capture)
+            flags = list(case.flags)
+            self.assertEqual(flags[flags.index("--backend") + 1], "vulkan")
+            index = flags.index("--physics-budget-ms")
+            budget = flags[index + 1]
+            del flags[index:index + 2]
+            pairs.setdefault(tuple(flags), []).append(budget)
+            if case.graphical:
+                values = dict(zip(flags[::2], flags[1::2]))
+                self.assertEqual(values["--mode"], "native")
+                self.assertEqual(values["--warmup-seconds"], "8")
+                self.assertEqual(values["--sample-seconds"], "30")
+                native_scenarios.add((values["--scenario"], values["--quality"]))
+            else:
+                self.assertEqual(flags[flags.index("--steps") + 1], "40")
+                self.assertEqual(flags[flags.index("--warmup-steps") + 1], "8")
+                if "--wave" in flags:
+                    self.assertEqual(flags[flags.index("--presteps") + 1], "120")
+                else:
+                    self.assertNotIn("--presteps", flags)
+                stage_scenarios.add("--wave" in flags)
+        self.assertEqual(native_scenarios, {("idle", "medium"), ("wave", "medium"),
+                                            ("paused", "medium"), ("wave", "low")})
+        self.assertEqual(stage_scenarios, {False, True})
+        self.assertEqual(len(pairs), 6)
+        self.assertTrue(all(sorted(budgets) == ["0", "12"] for budgets in pairs.values()))
+
+    def test_unavailable_issue_39_does_not_change_other_cases(self):
+        cases = acceptance.build_cases(issue_39_available=False)
+        self.assertEqual(cases, [case for case in acceptance.build_cases() if case.issue != 39])
+        self.assertEqual(acceptance.build_cases(39, issue_39_available=False), [])
 
     def test_commands_use_current_python_detected_labels_and_unique_paths(self):
         for case in acceptance.build_cases():
@@ -246,6 +319,11 @@ class ExecutionTests(unittest.TestCase):
 
 
 class SummaryAndArchiveTests(unittest.TestCase):
+    def setUp(self):
+        probe = patch.object(acceptance, "probe_issue_39", return_value=None)
+        self.probe = probe.start()
+        self.addCleanup(probe.stop)
+
     def test_summary_separates_graphical_diagnostic_correctness_and_failures(self):
         native = native_fixture()
         native.update(os="mock test host", physics_settings={"quality": "medium", "water_depth": 2.0})
@@ -320,19 +398,70 @@ class SummaryAndArchiveTests(unittest.TestCase):
             self.assertEqual(acceptance.main(["--results", str(directory), "--with-checks"]), 1)
             run.assert_not_called()
 
-    def test_success_and_unavailable_selector_exit_codes(self):
-        for issue, expected in ((37, 0), (39, 1)):
-            cases = acceptance.build_cases(issue)[:1]
+    def test_only_39_runs_all_available_cases_and_separates_stage_diagnostics(self):
+        def measured(case, hardware, directory):
+            return {"name": case.name, "issue": case.issue, "graphical": case.graphical,
+                    "status": "measured" if case.graphical else "diagnostic",
+                    "report": native_fixture() if case.graphical else
+                    {"kind": "synchronized_evolving_stages", "simulated_seconds": 0.1}}
 
-            def measured(case, hardware, directory):
-                return {"name": case.name, "graphical": True, "status": "measured", "report": render_fixture()}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance, "preflight", return_value=HARDWARE), patch.object(
+                acceptance, "execute_case", side_effect=measured) as run, contextlib.redirect_stdout(io.StringIO()) as stdout:
+            directory = Path(tmp) / "run"
+            self.assertEqual(acceptance.main(["--results", str(directory), "--only", "39"]), 0)
+            self.assertEqual([call.args[0] for call in run.call_args_list], acceptance.build_cases(39))
+            summary = stdout.getvalue()
+            self.assertNotIn("Issue #39: skipped", summary)
+            graphical, stages = summary.split("SYNCHRONIZED Vulkan stage diagnostics")
+            self.assertIn("39-budget-12-medium-wave: measured graphically", graphical)
+            self.assertIn("39-budget-0-low-wave: measured graphically", graphical)
+            self.assertIn("39-budget-12-stages-idle: diagnostic; FPS/frame=unmeasured", stages)
+            self.assertIn("39-budget-0-stages-wave: diagnostic; FPS/frame=unmeasured", stages)
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["issue_39"], {"status": "available"})
+            self.assertEqual(len(manifest["cases"]), 12)
 
-            with self.subTest(issue=issue), tempfile.TemporaryDirectory() as tmp, patch.object(
-                    acceptance, "preflight", return_value=HARDWARE), patch.object(acceptance, "build_cases",
-                    return_value=cases), patch.object(acceptance, "execute_case", side_effect=measured), contextlib.redirect_stdout(
-                    io.StringIO()) as stdout:
-                self.assertEqual(acceptance.main(["--results", str(Path(tmp) / "run"), "--only", str(issue)]), expected)
-                self.assertIn("Issue #39: skipped", stdout.getvalue())
+    def test_unavailable_issue_39_is_skipped_with_probe_reason(self):
+        reason = "fluids.benchmark --help does not advertise --physics-budget-ms in this checkout."
+        self.probe.return_value = reason
+
+        def measured(case, hardware, directory):
+            return {"name": case.name, "issue": case.issue, "graphical": case.graphical,
+                    "status": "measured" if case.graphical else "diagnostic",
+                    "report": render_fixture() if case.capture else native_fixture() if case.graphical else {}}
+
+        for only, expected, size in (([], 0, 33), (["--only", "39"], 1, 0)):
+            with self.subTest(only=only), tempfile.TemporaryDirectory() as tmp, patch.object(
+                    acceptance, "preflight", return_value=HARDWARE), patch.object(acceptance, "execute_case",
+                    side_effect=measured) as run, contextlib.redirect_stdout(io.StringIO()) as stdout:
+                directory = Path(tmp) / "run"
+                self.assertEqual(acceptance.main(["--results", str(directory), *only]), expected)
+                self.assertEqual(run.call_count, size)
+                self.assertIn(f"Issue #39: skipped — {reason}", stdout.getvalue())
+                manifest = json.loads((directory / "manifest.json").read_text())
+                self.assertEqual(manifest["issue_39"], {"status": "skipped", "reason": reason})
+                self.assertTrue(all(row["issue"] != 39 for row in manifest["cases"]))
+                self.assertTrue(directory.with_suffix(".zip").exists())
+
+    def test_only_39_preflight_refusal_archives_every_case_without_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance, "preflight", side_effect=
+                acceptance.PreflightError("DISPLAY is unset")), patch.object(acceptance, "execute_case") as run, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            directory = Path(tmp) / "run"
+            self.assertEqual(acceptance.main(["--results", str(directory), "--only", "39"]), 1)
+            run.assert_not_called()
+            rows = json.loads((directory / "manifest.json").read_text())["cases"]
+            self.assertEqual(len(rows), 12)
+            self.assertTrue(all(row["status"] == "skipped" and "report" not in row for row in rows))
+            self.assertNotIn("FPS=", stdout.getvalue())
+            self.assertIn("unexecuted/unmeasured", stdout.getvalue())
+            self.assertTrue(directory.with_suffix(".zip").exists())
+
+    def test_other_issue_selector_does_not_probe_issue_39(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(acceptance, "preflight", side_effect=
+                acceptance.PreflightError("DISPLAY is unset")), contextlib.redirect_stdout(io.StringIO()):
+            acceptance.main(["--results", str(Path(tmp) / "run"), "--only", "37"])
+            self.probe.assert_not_called()
 
     def test_existing_results_or_archive_are_never_overwritten(self):
         for artifact in ("run", "run.zip"):

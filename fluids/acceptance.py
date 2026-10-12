@@ -114,7 +114,25 @@ def preflight(directory):
     return detect_hardware(evidence["glxinfo"], evidence["vulkaninfo"], evidence["xrandr"])
 
 
-def build_cases(only=None):
+def probe_issue_39(directory):
+    """Return a truthful skip reason, or None when the budget flag is supported."""
+    command = [sys.executable, "-m", "fluids.benchmark", "--help"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        (directory / "benchmark-help.stderr.txt").write_text(str(exc) + "\n")
+        return f"Could not probe fluids.benchmark --help: {exc}; see benchmark-help.stderr.txt."
+    (directory / "benchmark-help.stdout.txt").write_text(result.stdout)
+    (directory / "benchmark-help.stderr.txt").write_text(result.stderr)
+    if result.returncode:
+        return (f"fluids.benchmark --help exited {result.returncode}; "
+                "see benchmark-help.stderr.txt and check the documented venv/dependencies.")
+    if not re.search(r"(?<![\w-])--physics-budget-ms(?![\w-])", result.stdout):
+        return "fluids.benchmark --help does not advertise --physics-budget-ms in this checkout."
+    return None
+
+
+def build_cases(only=None, *, issue_39_available=True):
     """All cases in the checked-in README, keeping harness flags unchanged."""
     cases = []
     native = ("--mode", "native", "--backend", "vulkan", "--warmup-seconds", "8",
@@ -142,6 +160,17 @@ def build_cases(only=None):
             cases.append(Case(f"38-{reads}-stages-{'wave' if wave else 'idle'}", 38, "fluids.benchmark",
                               stages + ("--timestep-reads", reads) + (("--wave", "--presteps", "120") if wave else ()),
                               graphical=False))
+    if issue_39_available:
+        for budget in ("12", "0"):
+            budget_flags = ("--physics-budget-ms", budget)
+            for scenario, quality in (("idle", "medium"), ("wave", "medium"), ("paused", "medium"),
+                                      ("wave", "low")):
+                cases.append(Case(f"39-budget-{budget}-{quality}-{scenario}", 39, "fluids.benchmark",
+                                  native + budget_flags + ("--scenario", scenario, "--quality", quality)))
+            for wave in (False, True):
+                cases.append(Case(f"39-budget-{budget}-stages-{'wave' if wave else 'idle'}", 39,
+                                  "fluids.benchmark", stages + budget_flags +
+                                  (("--wave", "--presteps", "120") if wave else ()), graphical=False))
     return [case for case in cases if only is None or case.issue == only]
 
 
@@ -239,7 +268,7 @@ def _flatten(value, prefix=""):
     return f"{prefix}={_number(value) if isinstance(value, float) else value}"
 
 
-def format_summary(results, hardware=None, checks=(), note=None):
+def format_summary(results, hardware=None, checks=(), note=None, issue_39=None):
     lines = ["Fluids acceptance (plain text)"]
     if hardware:
         lines.append(f"Renderer: {hardware.renderer}; GPU: {hardware.gpu}; driver: {hardware.driver}; "
@@ -250,7 +279,8 @@ def format_summary(results, hardware=None, checks=(), note=None):
         lines.append("Host: " + _flatten(host_labels))
     if note:
         lines.append(note)
-    lines.append("Issue #39: skipped — no documented harness in this checkout.")
+    if issue_39 and issue_39["status"] == "skipped":
+        lines.append(f"Issue #39: skipped — {issue_39['reason']}")
     lines.append("Correctness prerequisites — NON-PERFORMANCE (no frame/FPS evidence):")
     lines.extend(f"  {check['name']}: {check['status']}" for check in checks)
     if not checks:
@@ -346,11 +376,18 @@ def main(argv=None):
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         directory = Path(tempfile.mkdtemp(prefix=f"fluids-acceptance-{stamp}-", dir=Path.cwd()))
-    cases = build_cases(args.only)
+    if args.only in (None, 39):
+        reason = probe_issue_39(directory)
+        issue_39 = {"status": "skipped", "reason": reason} if reason else {"status": "available"}
+    else:
+        issue_39 = {"status": "not selected"}
+    cases = build_cases(args.only, issue_39_available=issue_39["status"] == "available")
     results = [{"name": case.name, "issue": case.issue, "graphical": case.graphical,
                 "status": "skipped", "reason": "not run"} for case in cases]
     hardware, checks, note, active_index = None, [], None, None
     try:
+        if not cases:
+            raise PreflightError(f"No cases available for issue #39: {issue_39['reason']}")
         hardware = preflight(directory)
         print(f"Renderer: {hardware.renderer}\nGPU: {hardware.gpu}\nDriver: {hardware.driver}\n"
               f"Refresh: {hardware.refresh_hz:g} Hz\nResults: {directory}", flush=True)
@@ -374,10 +411,10 @@ def main(argv=None):
         for result in results:
             if result["status"] == "skipped":
                 result["reason"] = note
-    summary = format_summary(results, hardware, checks, note)
+    summary = format_summary(results, hardware, checks, note, issue_39)
     manifest = {"hardware": asdict(hardware) if hardware else None, "only": args.only,
                 "checks_non_performance": checks, "cases": results, "note": note,
-                "issue_39": "skipped: no documented harness in this checkout"}
+                "issue_39": issue_39}
     archive = assemble_archive(directory, manifest, summary)
     print(summary, end="")
     print(f"Results archive: {archive}", flush=True)

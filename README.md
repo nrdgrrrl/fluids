@@ -461,20 +461,30 @@ refresh rate on all active displays so the report's refresh label is unambiguous
 The default pass runs all currently documented harness cases in fresh processes:
 issue #36's legacy/fixed/quality grids × idle/wave/paused native frames and its
 Vulkan stage comparisons; issue #37's stock/device staging × paused/active/wave,
-with PNG captures and ten water/city resets per case; and issue #38's
+with PNG captures and ten water/city resets per case; issue #38's
 duplicate/cached readbacks × idle/wave/paused at medium quality, low-quality wave
-frames, and Vulkan stage comparisons. Every graphical case excludes compilation,
+frames, and Vulkan stage comparisons; and issue #39's `--physics-budget-ms 12`
+versus `--physics-budget-ms 0` (the previous count-only scheduler), each with
+idle/wave/paused native frames at medium quality, a low-quality wave case, and
+Vulkan stage comparisons. Both budgets run in the same pass so responsiveness
+and simulated-time throughput can be compared. Every graphical case excludes compilation,
 the first frame and eight seconds of warm-up, then samples at least 30 seconds.
 Synchronized stages retain their existing eight-step warm-up and 40-step sample
-and are labelled separately: they do not measure graphical FPS. No issue #39
-harness is documented in this checkout; it is explicitly reported as skipped.
+and are labelled separately: they do not measure graphical FPS. Issue #39's
+stage diagnostics run both budgets with and without `--wave --presteps 120`.
+The runner probes `python -m fluids.benchmark --help` for `--physics-budget-ms`
+before scheduling #39. If the flag is absent or the probe fails, #39 is skipped
+with the actual reason in the summary and manifest; probe logs are archived.
 
-There are 23 graphical cases (about 15 minutes of warm-up/sampling alone) plus
-ten stage diagnostics and reset sweeps. Budget roughly **30–60 minutes**, depending
-on GPU speed and fresh-process compilation. **Do not use the mouse or keyboard
+With #39 available there are 45 cases: 31 graphical cases (about 20 minutes of
+warm-up/sampling alone), plus 14 stage diagnostics and the six rendering cases'
+reset sweeps. Allow roughly **40–90 minutes** for the expanded pass, depending
+on GPU speed and fresh-process compilation; this is a planning estimate, not a
+measured runtime. **Do not use the mouse or keyboard
 while the runner is running**; input can invalidate the comparisons.
-`python -m fluids.acceptance --only 37` reruns just one issue (36, 37 or 38).
-`--only 39` reports the unavailable harness as skipped and exits nonzero.
+`python -m fluids.acceptance --only 37` reruns just one issue (36, 37, 38 or 39).
+`python -m fluids.acceptance --only 39` runs the budget A/B and stage diagnostics
+when supported; it exits nonzero with a skip reason if the harness is unavailable.
 Optionally add `--with-checks`, from the repository root, to first run the focused
 and full CPU unittest tiers and windowless Vulkan smoke. These prerequisites are
 explicitly **non-performance**; their results never count as graphical evidence.
