@@ -451,31 +451,44 @@ python -m fluids.acceptance
 Linux desktop with X11/XWayland `DISPLAY`, a physical GPU device under `/dev/dri`,
 and the vendor's Vulkan driver. The runner reads the installed system graphics
 tools (`vulkaninfo --summary`, `xrandr --current`, and optionally `glxinfo -B`);
-it downloads nothing and adds no Python dependencies. Missing required tools or
-unknown GPU/driver/refresh metadata stop the pass with an actionable diagnostic.
+it adds no Python dependencies. The quick baseline may fetch its git commit.
+Missing required tools or unknown GPU/driver/refresh metadata stop the pass
+with an actionable diagnostic.
 Software renderers (`llvmpipe`, `lavapipe`, `softpipe`, `swrast`) are refused.
 If Vulkan exposes multiple devices, select the physical GPU's ICD using
 `VK_DRIVER_FILES` or `VK_ICD_FILENAMES`. Use a single active display or the same
 refresh rate on all active displays so the report's refresh label is unambiguous.
 
-When #39's harness flag is supported, the default profile runs a minimal set of
-**10 graphical cases**, each in a fresh process, at medium quality:
+The default is a quick visual A/B: **exactly two fresh application processes**,
+baseline then current, using the default medium scene and one wave. Baseline
+runs in a temporary detached git worktree at **`1c3132b`**, immediately before the
+optimization series; current runs from the working checkout, including local
+changes. Both use the same driver and normal application window, with two
+seconds of warm-up after the first frame and **25 seconds of sampling** (about
+27 seconds each, excluding compilation). Each saves a PNG of the evolved scene
+with the panel, records panel FPS averaged over the sample, and records sim
+rate and discard rate in simulation seconds per wall second. The verdict prints
+baseline versus current FPS and sim rate, their differences, and both screenshot
+paths. The windows run sequentially; captures and verdict provide the
+side-by-side comparison for the owner to judge visually.
 
-- #36: `legacy`-`idle`, `fixed`-`idle`, `fixed`-`wave`.
-- #38: `duplicate`-`idle`, `cached`-`idle`.
-- #37: `stock`-`paused`, `device`-`paused`, `device`-`active`, with PNG captures.
-- #39: `--physics-budget-ms 12`-`wave` and `--physics-budget-ms 0`-`wave`
-  (the previous count-only scheduler).
+Allow roughly **2–3 minutes** for the default, including preflight, worktree setup,
+fresh-process startup and compilation. This is an **unmeasured planning figure**.
+Default subprocesses share a 175-second budget, with a 75-second limit per
+application and short git timeouts. An unusually slow host may produce an
+incomplete, explicitly unmeasured run; packaging is extra. Timing overrides and
+`--with-checks` are outside that shared budget. The quick check does **not** cover
+every documented case or establish full issue acceptance.
 
-These establish the idle grid/readback comparisons, the fixed grid's active
-wave behavior, the paused staging visual A/B and device staging's active cost,
-and the budget A/B under wave load, when measured on the target GPU. They do
-**not** cover every documented case: there are no synchronized stage diagnostics,
-reset sweeps, low-quality cases, or quality-grid experiments, and the additional
-scenario combinations remain unmeasured. Captures still need human comparison;
-one pass does not establish repeatability or complete interaction acceptance.
+Baseline uses the existing venv and installs no dependencies. If the commit is
+missing locally, the runner attempts a bounded `git fetch origin 1c3132b`.
+If fetching or creating the worktree fails (including an installed package with
+no git checkout), baseline is clearly marked **unexecuted/unmeasured**, with
+setup logs archived, and **current still runs**. A baseline setup skip alone does
+not fail the command; the comparative verdict is unavailable until both runs
+succeed. The temporary worktree is removed after the baseline process.
 
-Use the exhaustive profile for the complete documented matrices:
+Use the exhaustive diagnostic profile for the complete documented matrices:
 
 ```sh
 python -m fluids.acceptance --full
@@ -485,55 +498,46 @@ python -m fluids.acceptance --full
 diagnostics; #37's stock/device × paused/active/wave, with captures and ten
 water/city resets per case; and, for each of #38 and #39, two modes × four native
 cases (idle/wave/paused at medium quality plus low-quality wave) and four stage
-diagnostics. The #36 `quality` layout's 0.7 m bins use about **72 MiB**: this is a
-documented non-default experiment, not a default acceptance case.
+diagnostics. With #39 available, there are **45 cases: 31 graphical and 14 stage
+diagnostics**, plus 60 resets. These graphical cases exclude compilation and the
+first frame, then use eight seconds of warm-up and **30 seconds of sampling**.
+Synchronized stages retain their eight-step warm-up and 40-step sample, labelled
+separately because they do not measure graphical FPS. #39's stages run both
+budgets with and without `--wave --presteps 120`. The #36 `quality` layout's
+0.7 m bins use about **72 MiB** and remain a diagnostic experiment.
 
-Both profiles exclude compilation and the first frame from graphical timing,
-then use eight seconds of warm-up and at least **30 seconds of sampling** by
-default. Full-profile synchronized stages retain their eight-step warm-up and
-40-step sample and are labelled separately: they do not measure graphical FPS.
-Issue #39's stage diagnostics run both budgets with and without
-`--wave --presteps 120`.
-The runner probes `python -m fluids.benchmark --help` for `--physics-budget-ms`
-before scheduling #39. If the flag is absent or the probe fails, #39 is skipped
-with the actual reason in the summary and manifest; probe logs are archived.
+Allow roughly **30–60 minutes** for `--full`; warm-up/sampling alone totals
+**19.6 minutes**, before compilation, stage diagnostics and resets. This is an
+unmeasured planning figure; slow GPUs can take longer. Before preflight the
+runner prints actual selected case counts, resets, window duration and a
+conservative estimate derived from the case list. Its allowances are 20–60
+seconds per graphical process, 30–90 seconds per stage diagnostic and 2–15
+seconds per reset, so the conservative range can exceed 30–60 minutes.
+The plan and requested windows are saved in the archive.
 
-With #39 available, default warm-up/sampling totals **6.3 minutes**. Its target is
-approximately **10 minutes**; allow roughly **10–16 minutes**, depending on
-fresh-process startup and shader/kernel compilation. The full profile has
-**45 cases: 31 graphical and 14 stage diagnostics**, plus 60 resets across six
-rendering cases. Sampling/warm-up alone takes **19.6 minutes**; allow roughly
-**40–90 minutes** for the whole full profile. These are **unmeasured planning
-estimates**, not runtime guarantees; slower GPUs or compilation may exceed them.
+Issue profiles probe `python -m fluids.benchmark --help` for `--physics-budget-ms`
+before scheduling #39. If unavailable, #39 is skipped with the actual reason
+and probe logs archived. The quick default needs no #39 probe.
 
-Before preflight or executing cases, the runner prints the actual selected case
-count, graphical/diagnostic counts, reset count, total warm-up/sampling time and
-estimated duration. The estimate is calculated from that case list and its
-timing flags, including `--only`, `--full`, #39 availability and timing overrides;
-it is not a hardcoded profile duration. Its planning allowances are 20–60 seconds
-per graphical process for startup/compilation, 30–90 seconds per stage diagnostic,
-and 2–15 seconds per reset. Preflight and optional correctness checks are extra.
-The plan and requested windows are saved in the results archive.
+**Do not use the mouse or keyboard during the pass**; input can invalidate the
+comparisons. `--only 36`, `37`, `38` or `39` explicitly selects that issue's focused
+cases, retained from the previous runner; add `--full` for its complete matrix.
+For example, `--only 39` selects the two medium wave budget cases;
+`--only 39 --full` adds other scenarios and stage diagnostics. Either exits
+nonzero if that issue's harness is unavailable.
 
-**Do not use the mouse or keyboard while the runner is running**; input can
-invalidate the comparisons. `python -m fluids.acceptance --only 37` selects that
-issue's default cases; add `--full` to select its exhaustive cases. `--only`
-accepts 36, 37, 38 or 39. `--only 39` runs the two medium-quality wave budget
-cases by default; `--only 39 --full` adds the other scenarios and stage diagnostics.
-Either exits nonzero with a skip reason if the harness is unavailable.
-
-For a cheap re-check after a failure, override either graphical timing window:
+For a cheap diagnostic re-check, override either graphical timing window:
 
 ```sh
 python -m fluids.acceptance --only 39 --warmup-seconds 2 --sample-seconds 5
 ```
 
-Both overrides require finite positive seconds and apply to both graphical
-harnesses in either profile; stage diagnostic step counts are unchanged.
-**Shorter windows weaken the evidence**: less warm-up may retain transient costs,
-and a sample below 30 seconds does not meet the issues' acceptance requirement.
-The runner warns and preserves the requested windows in its summary and manifest;
-repeat with the default 8-second warm-up and 30-second sample for acceptance.
+Overrides require finite positive seconds. They apply to both A/B builds or the
+selected issue's graphical harnesses; stage step counts stay unchanged. Shorter
+windows weaken evidence. Issue acceptance still needs the issue profiles'
+eight-second warm-up and 30-second sample; the 25-second default is a quick
+visual check. Requested windows are preserved in the summary and manifest.
+
 Optionally add `--with-checks`, from the repository root, to first run the focused
 and full CPU unittest tiers and windowless Vulkan smoke. These prerequisites are
 explicitly **non-performance**; their results never count as graphical evidence.
