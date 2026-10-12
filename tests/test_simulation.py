@@ -9,6 +9,7 @@ import numpy as np
 import taichi as ti
 
 from fluids.config import CFL_FACTOR, MAX_FRAME_TIME, MAX_SUBSTEPS, MAX_TIME_STEP, Settings
+from fluids.benchmark import _count_scalar_reads, _timestep_read_mode
 from fluids.density import PRESSURE_STIFFNESS
 from fluids.grid import CELL_CAPACITY
 from fluids.simulation import Simulation, SpatialGridOverflowError
@@ -128,7 +129,19 @@ class SimulationTests(unittest.TestCase):
             return wrapper
 
         solver = self.sim.dynamics
+        reads = {"timestep": 0, "overflow": 0}
+        field_type = type(solver._step_limit)
+        original_read = field_type.__getitem__
+
+        def read(field, key):
+            if field is solver._step_limit:
+                reads["timestep"] += 1
+            elif field is self.sim.grid.overflow_count:
+                reads["overflow"] += 1
+            return original_read(field, key)
+
         with (
+            patch.object(field_type, "__getitem__", new=read),
             patch.object(self.sim.grid, "build", new=record("grid", self.sim.grid.build)),
             patch.object(solver.density, "_compute", new=record("density", solver.density._compute)),
             patch.object(solver, "_compute_forces", new=record("forces", solver._compute_forces)),
@@ -138,6 +151,7 @@ class SimulationTests(unittest.TestCase):
         ):
             self.sim.step()
         self.assertEqual(order, ["grid", "density", "forces", "integration", "collisions"])
+        self.assertEqual(reads, {"timestep": 1, "overflow": 1})
 
     def test_frame_chunking_preserves_physics_steps_and_fractional_time(self):
         live = self.settings.with_updates(gravity=0, damping=1)
@@ -157,6 +171,23 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(results[0][1], results[1][1])
         self.assertEqual(results[0][2], results[1][2])
         self.assertTrue(all(dt == MAX_TIME_STEP for dt in results[0][1]))
+
+    def test_saturated_frame_has_24_reads_instead_of_36_with_same_progress(self):
+        results = []
+        for mode, timestep_reads in (("cached", MAX_SUBSTEPS), ("duplicate", 2 * MAX_SUBSTEPS)):
+            self.sim.reset()
+            self.upload([[-10, 5, 10]], [[40, 0, 0]])
+            with (_timestep_read_mode(self.sim, mode), _count_scalar_reads(self.sim) as reads,
+                  patch.object(type(self.sim.particles.positions), "to_numpy",
+                               side_effect=AssertionError("particle download"))):
+                self.assertEqual(self.sim.advance(0.2), MAX_SUBSTEPS)
+            self.assertEqual(reads, {"overflow": MAX_SUBSTEPS, "timestep": timestep_reads})
+            results.append((self.sim.simulated_time, self.sim.discarded_time,
+                            self.sim.particles.positions.to_numpy(),
+                            self.sim.particles.velocities.to_numpy()))
+        self.assertEqual(results[0][:2], results[1][:2])
+        np.testing.assert_array_equal(results[0][2], results[1][2])
+        np.testing.assert_array_equal(results[0][3], results[1][3])
 
     def test_pause_and_zero_speed_clear_backlog_and_single_step_ignores_both(self):
         self.upload([[-10, 5, 10]], [[1, 0, 0]])
@@ -193,6 +224,8 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(self.sim.simulated_time, elapsed)
 
     def test_overflow_raises_specific_error_and_skips_all_physics_then_recovers(self):
+        self.upload([[-10, 5, 10]])
+        self.sim._prepare_step(self.settings)
         self.upload(np.tile([-10, 5, 10], (CELL_CAPACITY + 7, 1)))
         state = self.sim.particles
         fields = (state.positions, state.velocities, state.accelerations,
@@ -214,6 +247,7 @@ class SimulationTests(unittest.TestCase):
         self.assertIs(raised.exception, self.sim.last_error)
         self.assertEqual(self.sim.simulated_time, 0)
         self.assertEqual(self.sim.last_substeps, 0)
+        self.assertIsNone(self.sim.dynamics._cached_step_limit)
         self.assertEqual(self.sim.accumulated_time, 0)
         self.assertAlmostEqual(self.sim.discarded_time, 0.02)
         for field, expected in zip(fields, before):

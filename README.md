@@ -276,6 +276,73 @@ Target GPU model and driver, warmed rendering FPS, and discarded-time trend are
 visual pass and target-GPU smoke pass remain required before merging. Medium
 remains the default because no target-GPU measurement supports a change.
 
+### Issue #38 timestep readbacks
+
+`DynamicsSolver.stable_time_step` now lazily reads and validates the scalar GPU
+limit once per successful prepared force snapshot. Integration checks its dt
+against that cached bound. Reset, wave launch, every subsequent force preparation
+(including failed preparation), and successful integration invalidate the cache.
+Force-only callers do not read a timestep. Particle arrays stay on the device.
+The grid overflow read still gates all particle-writing physics passes.
+
+The kernel tests count actual scalar field accesses: a complete substep uses
+one overflow read and one timestep read, rather than one overflow and two
+timestep reads. A saturated 12-step frame therefore has **24 instead of 36**
+such reads. The cached and duplicate control also produce the same simulation
+progress and particle state in that test. Frames that prepare a snapshot but
+lack accumulated time to integrate it can have additional preparation reads;
+the benchmark reports observed counts rather than assuming two per substep.
+
+Use the existing benchmark's default fixed 1.0 m grid for the comparison, with
+both modes in fresh processes. `duplicate` restores property readback on every
+access using the current kernels; it is a readback control, not an old revision.
+On the Intel desktop, alternate the order over several repeats:
+
+```sh
+for reads in duplicate cached; do
+  python -m fluids.benchmark --backend vulkan --timestep-reads "$reads" --steps 40
+  python -m fluids.benchmark --backend vulkan --timestep-reads "$reads" \
+    --steps 40 --wave --presteps 120
+  for scenario in idle wave paused; do
+    python -m fluids.benchmark --mode native --timestep-reads "$reads" \
+      --scenario "$scenario" --warmup-seconds 8 --sample-seconds 30 \
+      --device-label 'Intel UHD Graphics (CML GT2, 8086:9b41)' \
+      --driver 'Mesa 25.2.8 / i915' --refresh-hz 59.96
+  done
+  python -m fluids.benchmark --mode native --timestep-reads "$reads" \
+    --quality low --scenario wave --warmup-seconds 8 --sample-seconds 30 \
+    --device-label 'Intel UHD Graphics (CML GT2, 8086:9b41)' \
+    --driver 'Mesa 25.2.8 / i915' --refresh-hz 59.96
+done
+```
+
+Record actual driver/refresh metadata and verify i915 render-engine activity on
+the target machine. Stage reports include grid/density/forces/timestep-readback/
+integration/collision timings and scalar read counts. The timestep stage is
+per read (40 samples for cached, 80 for duplicate), not summed per substep.
+These diagnostics synchronize each stage and include host dispatch and
+synchronization costs; they are not isolated GPU timestamps. Native reports
+add no synchronization and include warmed frame and physics-advance timings,
+simulation progress per wall second, discarded time, completed substeps, and
+scalar read counts. Compare simulation progress as well as frame duration.
+Candidate-array downloads occur only outside stage sampling, never in native
+sampling or normal simulation.
+
+This run container has no `/dev/dri`, Vulkan ICD, or `DISPLAY`. Intel Vulkan
+frame/FPS, simulation-progress, stage-timing, and GPU-memory results are
+**unmeasured**; the commands above remain owner measurements. CPU kernel tests
+and `--backend cpu` stage diagnostics validate read counts and behavior only.
+
+Device-side overflow/timestep consumption was evaluated but is not enabled in
+this change. The existing neighbor readiness guard suppresses traversal, not
+the density/pressure writes surrounding it; force, integration, and collision
+writes would also need whole-pass guards before any host overflow gate could
+be removed. A safe asynchronous path would require ordered guarded passes and
+a combined status/timestep result before committing simulation time. Consuming
+dt only on the device still leaves the host accumulator needing the actual
+completed dt. Retaining the overflow gate preserves failure atomicity and
+pause/reset recovery while eliminating the redundant synchronization now.
+
 ### Issue #36 grid benchmark
 
 The default grid now uses 1.0 m cells, the largest supported smoothing radius.
