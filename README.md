@@ -155,9 +155,10 @@ Record each item as pass/fail/unexecuted in the implementation PR:
 4. Edit every Water, City, and Physics control. Confirm live effects, pending
    reset markers, depth/quality rebuilds, height bounds, seeds, and zero/fast
    playback. Confirm legacy wave controls are identified as inactive.
-5. Set high quality with 4 m depth and reset to exercise overflow recovery.
-   Lower quality/depth, reset, and resume; confirm the error clears and input
-   remains usable during recovery. For startup failure handling, launch with
+5. Set high quality with 4 m depth and reset to exercise the largest supported
+   initial lattice; tighter bins now fit it without overflow. The smoke check
+   forces overflow by collapsing particles into one bin, verifies failure leaves
+   fluid state untouched, and tests reset recovery. For startup failure handling, launch with
    `TI_ENABLE_VULKAN=0` and confirm a nonzero exit without a window/CPU fallback.
 
 Compilation and the first rendered frame are excluded from the application
@@ -191,6 +192,102 @@ Target GPU model and driver, warmed rendering FPS, and discarded-time trend are
 visual pass and target-GPU smoke pass remain required before merging. Medium
 remains the default because no target-GPU measurement supports a change.
 
+### Issue #36 grid benchmark
+
+The default grid now uses 1.0 m cells, the largest supported smoothing radius.
+All neighbor traversal, including density and forces, uses the grid's layout.
+The allocation still covers 48 × 16 × 32 m from the current world's lower bound
+and is reused across depth, quality, and city resets. The 256-index cell capacity,
+overflow gate, physics settings, and timestep limits are unchanged.
+
+Run each layout in a separate process, alternating order over several repeats:
+
+```sh
+for layout in legacy fixed quality; do
+  python -m fluids.benchmark --backend cpu --layout "$layout" --steps 40
+  python -m fluids.benchmark --backend cpu --layout "$layout" --steps 40 --wave --presteps 120
+done
+```
+
+`legacy` reproduces the 1.6 m **layout using the updated shared kernels**;
+it does not time the old revision's implementation. `fixed` uses 1.0 m cells;
+`quality` uses the selected quality's smoothing radius (1.0/0.7/0.5 m).
+`--quality` and `--depth` select the scene without changing other physics settings.
+Smaller layouts expand their search stencil if a later quality reset increases
+the radius; their field allocations stay fixed. The default remains 1.0 m to
+limit memory while supporting every quality with a 27-cell search. Medium
+quality-sized bins require nearly three times its bin memory; high requires
+192.75 MiB. Compact cell ranges would be a separate implementation if those
+layouts' target-GPU gains justify adopting them.
+
+Stage mode compiles all kernels, restores the scene, optionally launches a wave
+and advances `--presteps`, then warms eight evolving steps before sampling 40.
+It reports candidate checks before distance rejection, grid field bytes, and
+grid/density/forces/integration/collisions wall-time distributions. Each stage
+includes explicit synchronization overhead; diagnostic substep times are not
+native frame times. Field downloads for candidate counting happen outside
+measured intervals. Evolving scenes are compared independently, not bitwise.
+
+On the Intel CML GT2 desktop, first run `python -m fluids.smoke`, then repeat
+the stage commands with `--backend vulkan`. To measure complete native frames
+using the existing application loop, run:
+
+```sh
+for layout in legacy fixed quality; do
+  for scenario in idle wave paused; do
+    python -m fluids.benchmark --mode native --layout "$layout" --scenario "$scenario" \
+      --device-label 'Intel UHD Graphics (CML GT2, 8086:9b41)' \
+      --driver 'Mesa 25.2.8 / i915' --refresh-hz 59.96
+  done
+done
+```
+
+Use the machine's actual driver and refresh rate. Avoid input or settings edits
+during a sample. Native mode requires Vulkan without fallback, preserves the
+1440 × 900 vsynced window, excludes compilation and the first presented frame,
+warms for eight seconds, and samples for at least 30 seconds before closing.
+It reports FPS, complete frame durations, physics-advance wall time, completed
+substeps, simulated time, discarded time/rate, and accumulator endpoints.
+It adds no synchronization to the application loop: physics-advance timings
+include its dispatch/readback waits; the complete frames include presentation.
+Native and synchronized stage results should be collected separately.
+Driver memory still needs owner observation; reported grid bytes are logical
+field sizes, excluding backend padding and driver allocations.
+
+Container measurements on 2026-10-12: Debian 12, Python 3.11.2, Taichi 1.7.4,
+CPU backend on an advertised AMD Ryzen 7 8745HS; default medium, 18,360 particles.
+Sequential single runs, with no tests running concurrently:
+
+| Layout | Initial checks/pass | Checks/particle | Logical grid MiB |
+| --- | ---: | ---: | ---: |
+| Legacy 1.6 m | 15,520,800 | 845.4 | 5.88 |
+| Fixed 1.0 m | 6,238,200 | 339.8 | 24.09 |
+| Quality 0.7 m | 2,654,400 | 144.6 | 71.57 |
+
+The fixed layout reduces initial candidate checks by 59.8%. CPU stage medians
+(milliseconds, 40 evolving samples after warm-up):
+
+| Start/layout | Grid | Density | Forces | Integration | Collisions | Diagnostic substep |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Initial/1.6 m | 0.26 | 4.67 | 5.32 | 0.13 | 0.36 | 11.07 |
+| Initial/1.0 m | 0.25 | 2.41 | 2.75 | 0.12 | 0.28 | 6.06 |
+| Initial/0.7 m | 0.27 | 1.87 | 2.21 | 0.10 | 0.22 | 4.79 |
+| 120 wave steps/1.6 m | 0.28 | 4.93 | 5.60 | 0.13 | 0.42 | 11.44 |
+| 120 wave steps/1.0 m | 0.23 | 3.06 | 3.37 | 0.11 | 0.28 | 7.39 |
+| 120 wave steps/0.7 m | 0.32 | 2.93 | 3.24 | 0.11 | 0.38 | 7.01 |
+
+These are container CPU observations, not predicted Intel timings or FPS.
+CPU contracts passed (158 tests, one desktop test skipped), including full
+neighbor-set comparisons for sampled lattice particles at every quality and
+0.5/2/4 m depths, boundary pairs, density/force reference tolerances, collisions,
+overflow atomicity, and reset field reuse. The separate CPU diagnostic also
+passed 120 wave steps, collision probes, ten resets, and overflow recovery.
+Vulkan smoke and native benchmark
+attempts both failed to create a Vulkan instance: this container exposes no
+GPU device, Vulkan ICD, or `DISPLAY`. Target Intel GPU stage timings, native
+frames/FPS, simulated/discarded time trends, driver memory, and visual acceptance
+are **unmeasured** and remain owner checks before merging.
+
 ## Approximation and resource limits
 
 - Water uses weakly compressible SPH, an artificial 20 m/s sound speed,
@@ -206,9 +303,10 @@ remains the default because no target-GPU measurement supports a change.
   neither crest height nor flood depth is a prediction.
 - Particle capacity is fixed at 131,072. The largest supported initial lattice
   has 114,000 particles, but particle capacity and grid capacity are separate
-  constraints. Each of the 30 × 10 × 20 spatial bins holds 256 indices. High
-  quality at 4 m depth overflows bins even at initialization (up to 343
-  particles in a cell); compression can overflow other scenes too.
+  constraints. Each of the 48 × 16 × 32 spatial bins holds 256 indices, using
+  about 24.09 MiB for bins and their metadata. Every supported initial lattice
+  fits these 1.0 m bins (at most 64 particles per cell); compression can still
+  overflow a cell and stop physics before any particle fields are changed.
 - Physics uses adaptive timesteps between 10 µs and 1/120 s, accepts at most
   0.1 s of each frame and runs at most 16 substeps. Excess requested time is
   discarded rather than integrated in an unsafe large step. High quality,

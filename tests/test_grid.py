@@ -40,6 +40,29 @@ class NeighborProbe:
             grid.for_each_neighbor(i, self.record)
 
 
+@ti.data_oriented
+class SampledNeighborProbe:
+    """Compare full neighbor sets of selected queries without an N-by-N field."""
+
+    def __init__(self, capacity, queries):
+        self.queries = ti.field(dtype=ti.i32, shape=len(queries))
+        self.queries.from_numpy(np.asarray(queries, dtype=np.int32))
+        self.rows = ti.field(dtype=ti.i32, shape=capacity)
+        self.rows.fill(-1)
+        for row, i in enumerate(queries):
+            self.rows[int(i)] = row
+        self.visits = ti.field(dtype=ti.i32, shape=(len(queries), capacity))
+
+    @ti.func
+    def record(self, i, j):
+        self.visits[self.rows[i], j] += 1
+
+    @ti.kernel
+    def run(self, grid: ti.template()):
+        for row in range(self.queries.shape[0]):
+            grid.for_each_neighbor(self.queries[row], self.record)
+
+
 class SpatialGridTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -71,12 +94,13 @@ class SpatialGridTests(unittest.TestCase):
         return indices[np.arange(CELL_CAPACITY)[None, :] < counts[:, None]]
 
     def test_grid_dimensions_and_all_supported_radii(self):
-        self.assertEqual(self.grid.cell_counts.shape, (30, 10, 20))
-        self.assertEqual(self.grid.particle_indices.shape, (30, 10, 20, 256))
-        self.assertEqual(CELL_SIZE, 1.6)
+        self.assertEqual(self.grid.cell_counts.shape, (48, 16, 32))
+        self.assertEqual(self.grid.particle_indices.shape, (48, 16, 32, 256))
+        self.assertEqual(CELL_SIZE, 1.0)
+        self.assertEqual(self.grid.storage_bytes, 25_264_156)
         self.assertLessEqual(max(PARTICLE_SPACING.values()) * SMOOTHING_LENGTH_FACTOR, CELL_SIZE)
 
-    def test_supported_extremes_insert_once_or_report_dense_cells(self):
+    def test_supported_extremes_insert_once_without_overflow(self):
         fields = (self.grid.cell_counts, self.grid.particle_indices, self.grid.overflow_count)
         for quality in PARTICLE_SPACING:
             for depth in (0.5, 4.0):
@@ -87,6 +111,7 @@ class SpatialGridTests(unittest.TestCase):
                     expected = np.zeros(GRID_SHAPE, dtype=np.int32)
                     np.add.at(expected, tuple(coords.T), 1)
                     expected_overflow = int(np.maximum(expected - CELL_CAPACITY, 0).sum())
+                    self.assertEqual(expected_overflow, 0)
                     self.assertEqual(self.grid.build(), expected_overflow)
                     counts = self.grid.cell_counts.to_numpy()
                     self.assertEqual(int(counts.sum()), self.state.active_count)
@@ -95,13 +120,7 @@ class SpatialGridTests(unittest.TestCase):
                     self.assertEqual(len(stored), self.state.active_count - expected_overflow)
                     self.assertEqual(len(np.unique(stored)), len(stored))
                     self.assertTrue(((stored >= 0) & (stored < self.state.active_count)).all())
-                    if expected_overflow == 0:
-                        np.testing.assert_array_equal(np.sort(stored), np.arange(self.state.active_count))
-                    else:
-                        # The specified bins cannot fit the deepest high-quality lattice.
-                        self.assertEqual((quality, depth), ("high", 4.0))
-                        self.assertEqual(expected_overflow, 5350)
-                        self.assertEqual(int(counts.max()), 343)
+                    np.testing.assert_array_equal(np.sort(stored), np.arange(self.state.active_count))
         self.assertIs(self.grid.cell_counts, fields[0])
         self.assertIs(self.grid.particle_indices, fields[1])
         self.assertIs(self.grid.overflow_count, fields[2])
@@ -212,7 +231,72 @@ class SpatialGridTests(unittest.TestCase):
                 np.testing.assert_array_equal(probe.visits.to_numpy(), expected)
                 cells = ti.Vector.field(3, dtype=ti.i32, shape=2)
                 map_cells(self.grid, self.state.positions, cells, 2)
-                np.testing.assert_array_equal(cells.to_numpy(), 0)
+                expected_cells = np.floor((points - origin) / self.grid.cell_size).astype(int)
+                np.testing.assert_array_equal(cells.to_numpy(), expected_cells)
+
+    def test_full_lattice_sampled_neighbors_match_brute_force_at_all_qualities_and_depths(self):
+        rng = np.random.default_rng(36)
+        # Reuse queries, probe, and grid fields across every reset. Extremal
+        # queries exercise the water's lower/upper faces as well as its interior.
+        queries = np.arange(40, dtype=np.int32)
+        probe = SampledNeighborProbe(self.state.capacity, queries)
+        grids = (self.grid, SpatialGrid(self.state, cell_size=0.7))
+        for quality in PARTICLE_SPACING:
+            for depth in (0.5, 2.0, 4.0):
+                with self.subTest(quality=quality, depth=depth):
+                    self.state.reset(self.settings.with_updates(quality=quality, water_depth=depth))
+                    points = self.state.lattice.positions()
+                    chosen = np.concatenate(([0, len(points) - 1],
+                                             rng.choice(np.arange(1, len(points) - 1), 38, replace=False)))
+                    probe.queries.from_numpy(chosen.astype(np.int32))
+                    rows = np.full(self.state.capacity, -1, dtype=np.int32)
+                    rows[chosen] = np.arange(len(chosen))
+                    probe.rows.from_numpy(rows)
+                    squared = np.sum((points[chosen, None] - points[None]) ** 2, axis=2)
+                    expected = squared <= np.float32(self.state.smoothing_radius)**2
+                    for grid in grids:
+                        probe.visits.fill(0)
+                        self.assertEqual(grid.run_substep(probe.run, grid), 0)
+                        actual = probe.visits.to_numpy()
+                        np.testing.assert_array_equal(actual[:, :len(points)], expected)
+                        np.testing.assert_array_equal(actual[:, len(points):], 0)
+
+    def test_quality_sized_layout_expands_stencil_and_reuses_fields_after_reset(self):
+        grid = SpatialGrid(self.state, cell_size=0.5)
+        fields = (grid.cell_counts, grid.particle_indices, grid._span)
+        probe = NeighborProbe(4)
+        for quality in ("high", "medium", "low", "high"):
+            self.state.reset(self.settings.with_updates(quality=quality))
+            # Low quality includes a neighbor two cell indices away. The exact
+            # support boundary is included once and just-outside is excluded.
+            points = self.upload([[-19.51, 0.1, 0.1], [-18.6, 0.1, 0.1],
+                                  [-19.01, 0.1, 0.1], [-19.009, 0.1, 0.1]])
+            probe.visits.fill(0)
+            self.assertEqual(grid.run_substep(probe.run, grid, 4), 0)
+            squared = np.sum((points[:, None] - points[None])**2, axis=2)
+            np.testing.assert_array_equal(probe.visits.to_numpy(),
+                                          squared <= np.float32(self.state.smoothing_radius)**2)
+            with patch.object(ti, "field", side_effect=AssertionError("new field")):
+                grid.reset()
+        self.assertEqual(fields, (grid.cell_counts, grid.particle_indices, grid._span))
+
+    def test_boundary_neighbor_sets_at_every_quality_and_depth(self):
+        probe = NeighborProbe(24)
+        for quality in PARTICLE_SPACING:
+            for depth in (0.5, 2.0, 4.0):
+                self.state.reset(self.settings.with_updates(quality=quality, water_depth=depth))
+                origin = np.asarray(self.state.world.domain_min, dtype=np.float32)
+                upper = np.asarray(self.state.world.domain_max, dtype=np.float32)
+                radius = self.state.smoothing_radius
+                corners = np.asarray(list(product(*zip(origin, upper))), dtype=np.float32)
+                toward_inside = np.where(corners == origin, 1, -1)
+                points = self.upload(np.concatenate((corners, corners + toward_inside * radius * 0.25,
+                                                    corners + toward_inside * radius * 0.75)))
+                probe.visits.fill(0)
+                self.assertEqual(self.grid.run_substep(probe.run, self.grid, len(points)), 0)
+                squared = np.sum((points[:, None] - points[None])**2, axis=2)
+                np.testing.assert_array_equal(probe.visits.to_numpy(),
+                                              squared <= np.float32(radius)**2)
 
     def test_incomplete_or_unbuilt_grid_cannot_supply_partial_neighbors(self):
         probe = NeighborProbe(1)
@@ -229,9 +313,12 @@ class SpatialGridTests(unittest.TestCase):
             with patch.object(self.state, "world", invalid_world):
                 with self.assertRaisesRegex(ValueError, "bounds"):
                     SpatialGrid(self.state)
-            with patch("fluids.grid.SMOOTHING_LENGTH_FACTOR", 4.0):
+            with patch.object(self.state, "lattice", replace(self.state.lattice, spacing=1.0)):
                 with self.assertRaisesRegex(ValueError, "smoothing radius"):
                     SpatialGrid(self.state)
+            for width in (0, 0.49, float("inf"), float("nan")):
+                with self.assertRaisesRegex(ValueError, "cell size"):
+                    SpatialGrid(self.state, cell_size=width)
         allocate.assert_not_called()
 
 

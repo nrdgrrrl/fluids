@@ -42,7 +42,7 @@ from .config import (
 )
 from .collisions import CollisionSolver
 from .density import PRESSURE_STIFFNESS, DensitySolver
-from .grid import CELL_CAPACITY, GRID_SHAPE, SpatialGrid
+from .grid import SpatialGrid
 from .particles import WATER_COLOR
 from .waves import WaveLauncher
 
@@ -142,6 +142,26 @@ class DynamicsSolver:
             remaining -= dt
         return 0
 
+    @ti.func
+    def _sum_force(self, i, j, offset, distance_squared, total, context):
+        radius, mass, viscosity, scale, pressure_i = context
+        if j != i and distance_squared < radius**2:
+            distance = ti.sqrt(distance_squared)
+            weight = 1.0 - distance / radius
+            density_j = ti.max(self.particles.densities[j], MIN_DENSITY)
+            acceleration = ti.Vector([0.0, 0.0, 0.0])
+            if distance > NUMERICAL_EPSILON:
+                pressure_j = self.particles.pressures[j] / (density_j * density_j)
+                acceleration -= (
+                    mass * (pressure_i + pressure_j)
+                    * scale * radius * weight**2 * offset / distance
+                )
+            # Coincident particles still exchange velocity via viscosity.
+            rate = viscosity * mass / density_j * scale * weight
+            acceleration += rate * (self.particles.velocities[j] - self.particles.velocities[i])
+            total += ti.Vector([acceleration[0], acceleration[1], acceleration[2], rate])
+        return total
+
     @ti.kernel
     def _compute_forces(
         self, smoothing_radius: ti.f32, particle_mass: ti.f32,
@@ -152,40 +172,15 @@ class DynamicsSolver:
         # Spiky gradient magnitude is 45/pi/h^4 * (1-r/h)^2.
         kernel_scale = 45.0 / (pi * smoothing_radius**5)
         for i in range(self.particles.count[None]):
-            position = self.particles.positions[i]
             velocity = self.particles.velocities[i]
             density_i = ti.max(self.particles.densities[i], MIN_DENSITY)
             pressure_i = self.particles.pressures[i] / (density_i * density_i)
-            acceleration = ti.Vector([0.0, -gravity, 0.0])
-            diffusion_rate = 0.0
-            cell = self.grid.cell_coordinates(position)
-            for dx, dy, dz in ti.ndrange((-1, 2), (-1, 2), (-1, 2)):
-                neighbor = cell + ti.Vector([dx, dy, dz])
-                if (
-                    0 <= neighbor[0] < GRID_SHAPE[0]
-                    and 0 <= neighbor[1] < GRID_SHAPE[1]
-                    and 0 <= neighbor[2] < GRID_SHAPE[2]
-                ):
-                    count = ti.min(self.grid.cell_counts[neighbor], CELL_CAPACITY)
-                    for slot in range(count):
-                        j = self.grid.particle_indices[neighbor[0], neighbor[1], neighbor[2], slot]
-                        offset = position - self.particles.positions[j]
-                        distance_squared = offset.dot(offset)
-                        if j != i and distance_squared < smoothing_radius**2:
-                            distance = ti.sqrt(distance_squared)
-                            weight = 1.0 - distance / smoothing_radius
-                            density_j = ti.max(self.particles.densities[j], MIN_DENSITY)
-                            if distance > NUMERICAL_EPSILON:
-                                pressure_j = self.particles.pressures[j] / (density_j * density_j)
-                                acceleration += (
-                                    particle_mass * (pressure_i + pressure_j)
-                                    * kernel_scale * smoothing_radius * weight**2 * offset / distance
-                                )
-                            # Coincident particles have no defined pressure
-                            # direction, but still exchange velocity via viscosity.
-                            rate = viscosity * particle_mass / density_j * kernel_scale * weight
-                            diffusion_rate += rate
-                            acceleration += rate * (self.particles.velocities[j] - velocity)
+            total = self.grid.reduce_neighbors(
+                i, self._sum_force, ti.Vector([0.0, -gravity, 0.0, 0.0]),
+                (smoothing_radius, particle_mass, viscosity, kernel_scale, pressure_i),
+            )
+            acceleration = ti.Vector([total[0], total[1], total[2]])
+            diffusion_rate = total[3]
             magnitude = acceleration.norm()
             if magnitude > MAX_ACCELERATION:
                 acceleration *= MAX_ACCELERATION / magnitude

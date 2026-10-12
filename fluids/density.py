@@ -15,7 +15,7 @@ from math import pi
 import taichi as ti
 
 from .config import REST_DENSITY
-from .grid import CELL_CAPACITY, GRID_SHAPE, SpatialGrid
+from .grid import SpatialGrid
 
 
 # Linear weakly compressible equation of state, with an artificial sound speed
@@ -38,6 +38,11 @@ class DensitySolver:
             self._compute, self.particles.smoothing_radius, self.particles.mass,
         )
 
+    @ti.func
+    def _sum_weight(self, i, j, offset, distance_squared, total, radius_squared):
+        weight = ti.max(1.0 - distance_squared / radius_squared, 0.0)
+        return total + weight * weight * weight
+
     @ti.kernel
     def _compute(self, smoothing_radius: ti.f32, particle_mass: ti.f32):
         radius_squared = smoothing_radius * smoothing_radius
@@ -45,27 +50,8 @@ class DensitySolver:
         # The equivalent normalized form avoids forming very small h^9 values.
         self_density = particle_mass * 315.0 / (64.0 * pi * smoothing_radius**3)
         for i in range(self.particles.count[None]):
-            position = self.particles.positions[i]
-            cell = self.grid.cell_coordinates(position)
-            kernel_sum = 0.0
-            # Each cell is visited once. Skip out-of-bounds cells rather than
-            # clamping them, which would duplicate neighbors at domain edges.
-            for dx, dy, dz in ti.ndrange((-1, 2), (-1, 2), (-1, 2)):
-                neighbor = cell + ti.Vector([dx, dy, dz])
-                if (
-                    0 <= neighbor[0] < GRID_SHAPE[0]
-                    and 0 <= neighbor[1] < GRID_SHAPE[1]
-                    and 0 <= neighbor[2] < GRID_SHAPE[2]
-                ):
-                    count = ti.min(self.grid.cell_counts[neighbor], CELL_CAPACITY)
-                    for slot in range(count):
-                        j = self.grid.particle_indices[neighbor[0], neighbor[1], neighbor[2], slot]
-                        offset = self.particles.positions[j] - position
-                        distance_squared = offset.dot(offset)
-                        if distance_squared < radius_squared:
-                            # j == i contributes exactly one to this sum.
-                            weight = 1.0 - distance_squared / radius_squared
-                            kernel_sum += weight * weight * weight
+            # Self contributes one; exact support-boundary weights are zero.
+            kernel_sum = self.grid.reduce_neighbors(i, self._sum_weight, 0.0, radius_squared)
             density = self_density * kernel_sum
             self.particles.densities[i] = density
             compression = ti.max(density - REST_DENSITY, 0.0)

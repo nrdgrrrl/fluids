@@ -16,7 +16,7 @@ from fluids.config import (
     CFL_FACTOR, MAX_ACCELERATION, MAX_FRAME_TIME, MAX_SPEED, MAX_SUBSTEPS,
     MAX_TIME_STEP, MIN_DENSITY, MIN_TIME_STEP, REST_DENSITY, Settings,
 )
-from fluids.density import PRESSURE_STIFFNESS
+from fluids.density import MAX_PRESSURE, PRESSURE_STIFFNESS
 from fluids.dynamics import DynamicsSolver, SPLASH_COLOR
 from fluids.grid import CELL_CAPACITY, SpatialGrid
 from fluids.particles import WATER_COLOR, ParticleState
@@ -276,6 +276,42 @@ class DynamicsTests(unittest.TestCase):
                                         self.state.densities.to_numpy()[:2], self.state.pressures.to_numpy()[:2],
                                         self.state.smoothing_radius, self.state.mass, self.state.settings)
             np.testing.assert_allclose(self.state.accelerations.to_numpy()[:2], expected, rtol=5e-6, atol=1e-4)
+
+    def test_layouts_match_brute_force_density_and_forces_at_all_qualities_and_depths(self):
+        # The finer benchmark layout must remain correct when a reset increases
+        # the support radius. Reuse both solvers and their compiled kernels.
+        self.state = ParticleState(self.settings)
+        solvers = [DynamicsSolver(SpatialGrid(self.state, cell_size=width)) for width in (1.0, 0.5)]
+        rng = np.random.default_rng(36)
+        for quality in ("low", "medium", "high"):
+            for depth in (0.5, 2.0, 4.0):
+                settings = self.settings.with_updates(quality=quality, water_depth=depth, viscosity=0.3)
+                self.state.reset(settings)
+                origin = np.asarray(self.state.world.domain_min)
+                radius = self.state.smoothing_radius
+                cloud = origin + [3, 3, 3] + rng.uniform(-0.45 * radius, 0.45 * radius, (40, 3))
+                upper = np.asarray(self.state.world.domain_max)
+                points, velocities = self.upload(
+                    np.concatenate((cloud, [origin, origin + radius * 0.25, upper, upper - radius * 0.25])),
+                    rng.uniform(-2, 2, (44, 3)),
+                )
+                squared = np.sum((points.astype(np.float64)[:, None] - points[None])**2, axis=2)
+                weights = np.maximum(1 - squared / radius**2, 0)**3
+                density = self.state.mass * 315 / (64 * pi * radius**3) * weights.sum(axis=1)
+                pressure = np.clip(PRESSURE_STIFFNESS * (density - REST_DENSITY), 0, MAX_PRESSURE)
+                for solver in solvers:
+                    with self.subTest(quality=quality, depth=depth, cell_size=solver.grid.cell_size):
+                        self.assertEqual(solver.compute_forces(settings), 0)
+                        actual_density = self.state.densities.to_numpy()[:44]
+                        actual_pressure = self.state.pressures.to_numpy()[:44]
+                        np.testing.assert_allclose(actual_density, density, rtol=3e-6)
+                        np.testing.assert_allclose(actual_pressure, pressure, rtol=1e-5, atol=0.1)
+                        # Validate each pass independently at existing tolerances,
+                        # using the verified density snapshot consumed by forces.
+                        expected = reference_forces(points, velocities, actual_density, actual_pressure,
+                                                    radius, self.state.mass, settings)
+                        np.testing.assert_allclose(self.state.accelerations.to_numpy()[:44], expected,
+                                                   rtol=1e-5, atol=2e-4)
 
     def test_frame_limits_playback_pause_and_no_particle_downloads(self):
         points, _ = self.upload([[-10, 4, 10]], [[1, 0, 0]])

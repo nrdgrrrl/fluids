@@ -53,7 +53,7 @@ class SimulationTests(unittest.TestCase):
                   state.densities, state.pressures, state.colors, state.count,
                   self.sim.grid.cell_counts, self.sim.grid.particle_indices,
                   self.sim.grid.overflow_count, self.sim.grid._origin,
-                  self.sim.grid._radius, self.sim.grid._ready,
+                  self.sim.grid._radius, self.sim.grid._span, self.sim.grid._ready,
                   self.sim.dynamics.collisions.building_minimum,
                   self.sim.dynamics.collisions.building_maximum,
                   self.sim.dynamics.collisions.building_occupied,
